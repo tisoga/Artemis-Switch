@@ -186,24 +186,15 @@ public:
             return false;
         }
 
-        if (wgx_start(context_) != 0) {
-            wgx_destroy(context_);
-            context_ = nullptr;
-            if (udpSocket_ >= 0) { ::close(udpSocket_); udpSocket_ = -1; }
-            if (error) *error = "wgx_start failed";
-            return false;
-        }
-
         localIp_ = localIp;
-        running_ = true;
-        rxThread_ = std::thread(&RealWgxBackend::rxWorker, this);
+        tunnelCreated_ = true;
         return true;
     }
 
     bool addOrUpdatePeer(uint32_t peerId, const Key32& publicKey,
                          const std::string& peerIp, std::string* error) override {
-        if (!context_ || !running_) {
-            if (error) *error = "wgx tunnel is not running";
+        if (!context_ || !tunnelCreated_) {
+            if (error) *error = "wgx tunnel is not created";
             return false;
         }
         struct in_addr peerAddr{};
@@ -217,6 +208,17 @@ public:
             if (error) *error = "wgx_add_or_update_peer failed";
             return false;
         }
+
+        // Start WireGuard tunnel now that peer is registered (peer_count > 0)
+        if (!running_) {
+            if (wgx_start(context_) != 0) {
+                if (error) *error = "wgx_start failed";
+                return false;
+            }
+            running_ = true;
+            rxThread_ = std::thread(&RealWgxBackend::rxWorker, this);
+        }
+
         wgx_connect_peer(context_, peerId);
 
         ::memset(&peerEndpoint_, 0, sizeof(peerEndpoint_));
@@ -330,6 +332,7 @@ public:
             wgx_destroy(context_);
             context_ = nullptr;
         }
+        tunnelCreated_ = false;
         localIp_.clear();
         activePeerIp_.clear();
         activePeerId_ = 0;
@@ -338,7 +341,7 @@ public:
     }
 
     bool isRunning() const noexcept override {
-        return running_ && context_ != nullptr;
+        return tunnelCreated_ && context_ != nullptr;
     }
 
 private:
@@ -348,6 +351,7 @@ private:
     sockaddr_in peerEndpoint_{};
     uint32_t activePeerId_ = 0;
     bool activePeerConfigured_ = false;
+    bool tunnelCreated_ = false;
     std::thread rxThread_;
     std::string localIp_;
     std::string activePeerIp_;
