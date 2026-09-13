@@ -375,6 +375,34 @@ std::optional<MapUpdate> MapCodec::decode(std::string_view json,
             }
         }
     }
+    // Official control planes also emit PeersChangedPatch frames carrying
+    // partial per-node updates (presence, LastSeen, ...). Only the Online
+    // flag is actionable here; anything else is forward-compatible noise.
+    // Unknown or missing NodeIDs are skipped: the peer is either gone or from
+    // a future schema, and neither case may fail the update.
+    if (const auto patches = root.find("PeersChangedPatch");
+        patches != root.end() && patches->is_array()) {
+        if (patches->size() > PeerDirectory::kMaxPeers) {
+            if (error) *error = "netmap peer patch limit exceeded";
+            return std::nullopt;
+        }
+        for (const auto& patch : *patches) {
+            if (!patch.is_object())
+                continue;
+            const auto nodeIdIt = patch.find("NodeID");
+            const auto onlineIt = patch.find("Online");
+            if (nodeIdIt == patch.end() || !nodeIdIt->is_number_unsigned() ||
+                onlineIt == patch.end() || !onlineIt->is_boolean())
+                continue;
+            const auto found = nextIdMap.find(nodeIdIt->get<std::uint64_t>());
+            if (found == nextIdMap.end())
+                continue;
+            PeerOnlineChange change;
+            change.stableId = found->second;
+            change.online = onlineIt->get<bool>();
+            update.delta.onlineChanges.push_back(std::move(change));
+        }
+    }
     stableIdsByNodeId_ = std::move(nextIdMap);
     return update;
 }

@@ -99,6 +99,7 @@ bool TailscaleCore::activateRoute(const RemoteRouteTarget& target) {
     overlay_->stop();
     std::string error;
     if (!overlay_->start(target, &error)) {
+        LOG_CORE_ERROR("route activation failed: " + error);
         setState(Snapshot::State::Error, "Route failed", std::move(error));
         activeRoute_.reset();
         return false;
@@ -243,7 +244,8 @@ void TailscaleCore::workerMain(SecureBytes authKey, SecureBytes passphrase) {
             }
             continue;
         }
-        if (!delta.changed.empty() || !delta.removedStableIds.empty())
+        if (!delta.changed.empty() || !delta.removedStableIds.empty() ||
+            !delta.onlineChanges.empty())
             peers_.apply(delta, &error);
         if (derpMap)
             updateDerpMap(std::move(*derpMap));

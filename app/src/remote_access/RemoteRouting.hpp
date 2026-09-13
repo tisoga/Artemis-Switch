@@ -27,6 +27,10 @@ RemoteRouteLease acquireRouteFor(const std::string& address);
 std::string connectAddressFor(const RemoteRouteLease& lease,
                               const std::string& address);
 
+// Why the provider refused the route (its last error, or a generic reason).
+// Only meaningful when lease.refused() is true.
+std::string routeRefusalReason(const RemoteRouteLease& lease);
+
 void logConnectionAttempt(const RemoteRouteLease& lease,
                           const std::string& requestedAddress,
                           const std::string& dialAddress);

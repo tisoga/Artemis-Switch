@@ -132,5 +132,27 @@ int main() {
     assert(error == "netmap DERPMap.Regions is not an object");
     assert(!codec.decode("{\"DERPMap\":[]}", &error));
     assert(error == "netmap DERPMap is not an object");
+
+    // Official control planes emit PeersChangedPatch frames with partial
+    // per-node updates. NodeIDs resolve through the same mapping as
+    // removals; unknown or malformed entries are skipped, never fatal.
+    MapCodec patchCodec;
+    const auto patchFull = patchCodec.decode(
+        "{\"Peers\":[{\"ID\":7,\"StableID\":\"gaming-pc\",\"Key\":\"nodekey:" +
+            zeroKey + "\"}]}",
+        &error);
+    assert(patchFull && patchFull->fullPeers->size() == 1);
+    const auto patch = patchCodec.decode(
+        "{\"PeersChangedPatch\":["
+        "{\"NodeID\":7,\"Online\":false,\"LastSeen\":\"2026-09-13T19:32:40Z\"},"
+        "{\"NodeID\":777,\"Online\":true},"
+        "{\"Online\":true},"
+        "\"not-an-object\"]}",
+        &error);
+    assert(patch);
+    assert(patch->delta.onlineChanges.size() == 1);
+    assert(patch->delta.onlineChanges.front().stableId == "gaming-pc");
+    assert(!patch->delta.onlineChanges.front().online);
+    assert(!patch->derpMap.has_value());
     return 0;
 }

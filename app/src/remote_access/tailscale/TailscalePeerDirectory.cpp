@@ -109,6 +109,14 @@ bool PeerDirectory::apply(const PeerDelta& delta, std::string* error) {
         peers_.erase(id);
     for (const auto& peer : delta.changed)
         peers_.insert_or_assign(peer.stableId, peer);
+    // Presence patches apply to whatever the directory holds after the
+    // removals and updates above. Unknown IDs are stale races (the peer left
+    // between frames) and are skipped, never failed.
+    for (const auto& change : delta.onlineChanges) {
+        const auto found = peers_.find(change.stableId);
+        if (found != peers_.end())
+            found->second.online = change.online;
+    }
     return true;
 }
 

@@ -383,6 +383,7 @@ bool TailscaleControlSession::poll(PeerDelta* delta,
     derpMap->reset();
     delta->changed.clear();
     delta->removedStableIds.clear();
+    delta->onlineChanges.clear();
     localAddress->clear();
 
     std::string record;
@@ -444,6 +445,7 @@ bool TailscaleControlSession::poll(PeerDelta* delta,
     if (update->derpMap) *derpMap = std::move(*update->derpMap);
     delta->changed = std::move(update->delta.changed);
     delta->removedStableIds = std::move(update->delta.removedStableIds);
+    delta->onlineChanges = std::move(update->delta.onlineChanges);
     return true;
 }
 

@@ -79,6 +79,18 @@ std::string connectAddressFor(const RemoteRouteLease& lease,
     return kProxyAddress;
 }
 
+std::string routeRefusalReason(const RemoteRouteLease& lease) {
+    if (!lease.refused() || lease.providerId().empty())
+        return {};
+    if (auto* provider =
+            RemoteAccessManager::instance().provider(lease.providerId())) {
+        const std::string reason = provider->lastError();
+        if (!reason.empty())
+            return reason;
+    }
+    return "tunnel route refused for peer " + lease.peerId();
+}
+
 void logConnectionAttempt(const RemoteRouteLease& lease,
                            const std::string& requestedAddress,
                            const std::string& dialAddress) {
@@ -96,7 +108,7 @@ void logConnectionAttempt(const RemoteRouteLease& lease,
 void logConnectionResult(const RemoteRouteLease& lease,
                          const std::string& dialAddress, bool succeeded,
                          const std::string& detail) {
-    if (!lease.isActive())
+    if (!lease.isActive() && !lease.refused())
         return;
 
     std::string oneLineDetail = detail;

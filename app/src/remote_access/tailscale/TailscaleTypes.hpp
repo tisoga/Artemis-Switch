@@ -42,9 +42,15 @@ struct Peer {
     bool online = false;
 };
 
+struct PeerOnlineChange {
+    std::string stableId;
+    bool online = false;
+};
+
 struct PeerDelta {
     std::vector<Peer> changed;
     std::vector<std::string> removedStableIds;
+    std::vector<PeerOnlineChange> onlineChanges;
 };
 
 // A DERP relay region from the control plane's DERPMap. The relay address a

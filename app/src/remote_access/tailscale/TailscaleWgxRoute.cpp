@@ -11,6 +11,8 @@ extern "C" {
 #include "TailscaleDerp.hpp"
 #include "TailscaleTransport.hpp"
 #include "../../vpn/SocketFdLock.hpp"
+#include "../../utils/Settings.hpp"
+#include "../../vpn/VpnFileLogger.hpp"
 #include <wg_lwip_relay.hpp>
 
 #include <atomic>
@@ -178,6 +180,11 @@ namespace {
 void realIngressCallback(void*, const void*, size_t) {}
 void tailscaleRelayLog(wgnx::LogLevel, const char*) {}
 
+void logTsRoute(VpnFileLogger::Severity severity, std::string_view message) {
+    VpnFileLogger::append(Settings::instance().working_dir() + "/vpn.log",
+                          "TS", severity, message);
+}
+
 // Bounded byte-wise HTTP response header reader for the DERP upgrade.
 // Mirrors the control session's reader; the header ends at the first CRLFCRLF.
 bool readDerpUpgradeHeader(ITransport& transport, std::string* header,
@@ -227,8 +234,14 @@ public:
         if (!derpAlive_ || !derp_ || !havePeer_)
             return;
         const auto* bytes = static_cast<const std::uint8_t*>(packet);
-        derp_->sendPacket(std::span<const std::uint8_t>(peerNodeKey_.data(), peerNodeKey_.size()),
-                          std::span<const std::uint8_t>(bytes, length), nullptr);
+        if (derp_->sendPacket(std::span<const std::uint8_t>(peerNodeKey_.data(), peerNodeKey_.size()),
+                              std::span<const std::uint8_t>(bytes, length), nullptr)) {
+            if (!egressLogged_) {
+                egressLogged_ = true;
+                logTsRoute(VpnFileLogger::Severity::Info,
+                           "DERP relay sending peer packets");
+            }
+        }
     }
 
     bool startTunnel(const Key32& privateKey, const std::string& localIp,
@@ -337,26 +350,53 @@ public:
         tailscale_internal_crypto_x25519_public_key(localPublic.data(),
                                                     localPrivateKey.data());
 
+        logTsRoute(VpnFileLogger::Severity::Info,
+                   "dialing DERP region " + std::to_string(homeDerpRegion) +
+                       " (" + std::to_string(region->nodes.size()) +
+                       " node(s)) for peer");
         std::string lastError = "no DERP node attempted";
         for (const auto& node : region->nodes) {
+            logTsRoute(VpnFileLogger::Severity::Info,
+                       "DERP dialing " + node.host + ":" +
+                           std::to_string(node.port));
             auto transport = std::make_unique<SwitchTlsTransport>();
-            if (!transport->connect(node.host, node.port, &lastError))
+            if (!transport->connect(node.host, node.port, &lastError)) {
+                logTsRoute(VpnFileLogger::Severity::Warning,
+                           "DERP TLS to " + node.host + " failed: " +
+                               lastError);
                 continue;
+            }
             const std::string request = buildDerpUpgradeRequest(node.host);
             const std::span<const std::uint8_t> requestBytes(
                 reinterpret_cast<const std::uint8_t*>(request.data()),
                 request.size());
-            if (!transport->write(requestBytes, &lastError))
+            if (!transport->write(requestBytes, &lastError)) {
+                logTsRoute(VpnFileLogger::Severity::Warning,
+                           "DERP upgrade write to " + node.host +
+                               " failed: " + lastError);
                 continue;
+            }
             std::string header;
-            if (!readDerpUpgradeHeader(*transport, &header, &lastError))
+            if (!readDerpUpgradeHeader(*transport, &header, &lastError)) {
+                logTsRoute(VpnFileLogger::Severity::Warning,
+                           "DERP upgrade read from " + node.host +
+                               " failed: " + lastError);
                 continue;
-            if (!validateDerpUpgradeResponse(header, &lastError))
+            }
+            if (!validateDerpUpgradeResponse(header, &lastError)) {
+                logTsRoute(VpnFileLogger::Severity::Warning,
+                           "DERP upgrade rejected by " + node.host + ": " +
+                               lastError);
                 continue;
+            }
             auto session = std::make_unique<DerpSession>(
                 std::move(transport), localPrivateKey, localPublic);
-            if (!session->connect(&lastError))
+            if (!session->connect(&lastError)) {
+                logTsRoute(VpnFileLogger::Severity::Warning,
+                           "DERP auth with " + node.host +
+                               " failed: " + lastError);
                 continue;
+            }
             derp_ = std::move(session);
             peerNodeKey_ = peerNodeKey;
             havePeer_ = true;
@@ -365,11 +405,16 @@ public:
             derpAlive_ = true;
             derpRunning_ = true;
             derpThread_ = std::thread(&RealWgxBackend::derpReader, this);
+            logTsRoute(VpnFileLogger::Severity::Info,
+                       "DERP relay connected via " + node.host);
             return true;
         }
+        const std::string failure =
+            "DERP region " + std::to_string(homeDerpRegion) +
+            " unreachable: " + lastError;
         if (error)
-            *error = "DERP region " + std::to_string(homeDerpRegion) +
-                     " unreachable: " + lastError;
+            *error = failure;
+        logTsRoute(VpnFileLogger::Severity::Error, failure);
         return false;
     }
 
@@ -443,13 +488,19 @@ public:
     // Any other frame type is protocol housekeeping and safely ignored here.
     void derpReader() {
         std::string error;
+        bool firstPacketLogged = false;
         while (derpRunning_) {
             auto* session = derp_.get();
             if (!session)
                 break;
             auto frame = session->recvFrame(&error);
-            if (!frame)
+            if (!frame) {
+                if (derpRunning_)
+                    logTsRoute(VpnFileLogger::Severity::Warning,
+                               "DERP session ended: " +
+                                   (error.empty() ? "connection closed" : error));
                 break;
+            }
             switch (frame->type) {
             case DerpFrameType::RecvPacket: {
                 const auto& payload = frame->payload;
@@ -460,6 +511,11 @@ public:
                         context_, activePeerId_.load(std::memory_order_acquire),
                         payload.data() + kDerpKeyLen,
                         payload.size() - kDerpKeyLen);
+                    if (!firstPacketLogged) {
+                        firstPacketLogged = true;
+                        logTsRoute(VpnFileLogger::Severity::Info,
+                                   "DERP relay delivering peer packets");
+                    }
                 }
                 break;
             }
@@ -502,6 +558,7 @@ public:
         derp_.reset();
         derpAlive_ = false;
         havePeer_ = false;
+        egressLogged_ = false;
         activeDerpRegion_ = 0;
         activeDerpHost_.clear();
     }
@@ -549,6 +606,7 @@ private:
     std::atomic_bool derpAlive_{false};
     Key32 peerNodeKey_{};
     bool havePeer_ = false;
+    bool egressLogged_ = false;
     int activeDerpRegion_ = 0;
     std::string activeDerpHost_;
 };

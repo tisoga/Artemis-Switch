@@ -159,6 +159,18 @@ bool connect_to_addresses_sync(const std::vector<std::string>& addresses,
         // before any tunnel route is ever considered.
         RemoteRouteLease candidateLease =
             artemis::remote::acquireRouteFor(address);
+        if (candidateLease.refused()) {
+            // The address named a known tunnel peer but the provider could
+            // not build the packet path (no DERP relay, no proxy). Dialing
+            // the overlay address directly would blackhole into a minute-long
+            // TCP timeout, so fail fast with the provider's reason instead.
+            error = artemis::remote::routeRefusalReason(candidateLease);
+            if (error.empty())
+                error = "Tunnel route refused";
+            artemis::remote::logConnectionResult(candidateLease, address,
+                                                 false, error);
+            continue;
+        }
         const std::string dialAddress =
             artemis::remote::connectAddressFor(candidateLease, address);
 

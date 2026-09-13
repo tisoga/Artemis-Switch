@@ -47,6 +47,18 @@ int main() {
     assert(peers.resolveIPv4("100.64.0.12"));
     assert(peers.snapshot().size() == 1);
 
+    // Presence patches flip the online flag without touching addresses.
+    // Unknown IDs are stale races and must not fail the update.
+    PeerDelta presence;
+    presence.onlineChanges.push_back({"node-1", true});
+    presence.onlineChanges.push_back({"gone-node", false});
+    assert(peers.apply(presence, &error));
+    assert(peers.findByStableId("node-1")->online);
+    presence.onlineChanges.clear();
+    presence.onlineChanges.push_back({"node-1", false});
+    assert(peers.apply(presence, &error));
+    assert(!peers.findByStableId("node-1")->online);
+
     // A full directory may replace one peer with another in a single delta.
     std::vector<Peer> full;
     full.reserve(PeerDirectory::kMaxPeers);
