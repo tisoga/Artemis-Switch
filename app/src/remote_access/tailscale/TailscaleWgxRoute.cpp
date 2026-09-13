@@ -445,15 +445,11 @@ public:
             derpThread_ = std::thread(&RealWgxBackend::derpReader, this);
             logTsRoute(VpnFileLogger::Severity::Info,
                        "DERP relay connected via " + node.host);
-            // Ask the relay to report peer presence changes so the log shows
-            // whether the destination node is visible from this region.
-            {
-                std::lock_guard lock(derpWriteMutex_);
-                std::string watchError;
-                if (!derp_->writeRaw(DerpFrameType::WatchConns, {}, &watchError))
-                    logTsRoute(VpnFileLogger::Severity::Warning,
-                               "DERP presence watch failed: " + watchError);
-            }
+            // NOTE: no WatchConns subscription here. Frame 0x10 from a plain
+            // client is a protocol violation: the relay closes the session
+            // the instant it arrives, which used to masquerade as a peer
+            // handshake timeout. PeerPresent/PeerGone below stay handled in
+            // case the server volunteers any.
             return true;
         }
         const std::string failure =
