@@ -1,5 +1,7 @@
 #include "TailscaleDerp.hpp"
 
+#include "TailscaleBox.hpp"
+
 extern "C" {
 #include <monocypher.h>
 }
@@ -7,6 +9,7 @@ extern "C" {
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <random>
 
 #if defined(__SWITCH__)
 extern "C" {
@@ -121,23 +124,13 @@ bool DerpCrypto::seal(std::span<const std::uint8_t> plainText,
                       std::span<const std::uint8_t, kDerpNonceLen> nonce,
                       std::vector<std::uint8_t>& cipherTextOut,
                       std::string* error) {
-    Key32 sharedSecret{};
-    TS_DERP_X25519(sharedSecret.data(), myPrivate.data(), theirPublic.data());
-    const bool sharedZero = std::all_of(sharedSecret.begin(), sharedSecret.end(),
-                                        [](std::uint8_t b) { return b == 0; });
-    if (sharedZero) {
-        if (error) *error = "DERP crypto: weak or invalid X25519 shared secret";
-        return false;
-    }
-
-    cipherTextOut.resize(plainText.size() + kDerpTagLen);
-    std::uint8_t mac[kDerpTagLen]{};
-    TS_DERP_LOCK(cipherTextOut.data(), mac, sharedSecret.data(), nonce.data(),
-                 nullptr, 0, plainText.data(), plainText.size());
-    std::memcpy(cipherTextOut.data() + plainText.size(), mac, kDerpTagLen);
-    TS_DERP_WIPE(sharedSecret.data(), sharedSecret.size());
-    TS_DERP_WIPE(mac, sizeof(mac));
-    return true;
+    static_assert(kDerpNonceLen == kBoxNonceLen,
+                  "DERP and NaCl box nonces are both 24 bytes");
+    static_assert(kDerpKeyLen == 32, "DERP keys are 32-byte Curve25519 keys");
+    std::span<const std::uint8_t, kBoxNonceLen> boxNonce(nonce.data(),
+                                                        kBoxNonceLen);
+    return boxSeal(plainText, myPrivate, theirPublic, boxNonce, cipherTextOut,
+                   error);
 }
 
 bool DerpCrypto::open(std::span<const std::uint8_t> cipherText,
@@ -150,30 +143,10 @@ bool DerpCrypto::open(std::span<const std::uint8_t> cipherText,
         if (error) *error = "DERP crypto: ciphertext shorter than auth tag";
         return false;
     }
-
-    Key32 sharedSecret{};
-    TS_DERP_X25519(sharedSecret.data(), myPrivate.data(), theirPublic.data());
-    const bool sharedZero = std::all_of(sharedSecret.begin(), sharedSecret.end(),
-                                        [](std::uint8_t b) { return b == 0; });
-    if (sharedZero) {
-        if (error) *error = "DERP crypto: weak or invalid X25519 shared secret";
-        return false;
-    }
-
-    const std::size_t plainSize = cipherText.size() - kDerpTagLen;
-    plainTextOut.resize(plainSize);
-    const std::uint8_t* mac = cipherText.data() + plainSize;
-
-    const int unlockRes =
-        TS_DERP_UNLOCK(plainTextOut.data(), mac, sharedSecret.data(),
-                       nonce.data(), nullptr, 0, cipherText.data(), plainSize);
-    TS_DERP_WIPE(sharedSecret.data(), sharedSecret.size());
-    if (unlockRes != 0) {
-        plainTextOut.clear();
-        if (error) *error = "DERP crypto: ciphertext authentication failed";
-        return false;
-    }
-    return true;
+    std::span<const std::uint8_t, kBoxNonceLen> boxNonce(nonce.data(),
+                                                        kBoxNonceLen);
+    return boxOpen(cipherText, myPrivate, theirPublic, boxNonce, plainTextOut,
+                   error);
 }
 
 DerpSession::DerpSession(std::unique_ptr<ITransport> transport,
@@ -225,10 +198,14 @@ bool DerpSession::connect(std::string* error) {
     std::copy_n(greeting->payload.begin() + kDerpMagic.size(), kDerpKeyLen,
                 serverKey_.begin());
 
-    // Step 2: Send ClientInfo frame
+    // Step 2: Send ClientInfo frame. The nonce must be unique per handshake;
+    // a fixed nonce across reconnects would leak the keystream.
     std::array<std::uint8_t, kDerpNonceLen> clientNonce{};
-    for (std::size_t i = 0; i < clientNonce.size(); ++i)
-        clientNonce[i] = static_cast<std::uint8_t>(0x3C ^ (i * 5 + 1));
+    {
+        std::random_device source;
+        for (auto& byte : clientNonce)
+            byte = static_cast<std::uint8_t>(source());
+    }
 
     const std::string clientInfoJson = R"({"version":2})";
     std::vector<std::uint8_t> sealedClientInfo;

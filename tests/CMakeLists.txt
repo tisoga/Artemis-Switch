@@ -491,12 +491,23 @@ add_test(NAME tailscale_core_engine_test COMMAND tailscale_core_engine_test)
 add_executable(tailscale_derp_test
     "${REPO_ROOT}/tests/tailscale_derp_test.cpp"
     "${REPO_ROOT}/app/src/remote_access/tailscale/TailscaleDerp.cpp"
+    "${REPO_ROOT}/app/src/remote_access/tailscale/TailscaleBox.cpp"
     "${REPO_ROOT}/extern/wg-nx/library/crypto/monocypher.c")
 target_include_directories(tailscale_derp_test PRIVATE
     "${REPO_ROOT}/app/src/remote_access/tailscale"
     "${REPO_ROOT}/extern/wg-nx/library/crypto")
 target_compile_features(tailscale_derp_test PRIVATE cxx_std_20)
 add_test(NAME tailscale_derp_test COMMAND tailscale_derp_test)
+
+add_executable(tailscale_box_test
+    "${REPO_ROOT}/tests/tailscale_box_test.cpp"
+    "${REPO_ROOT}/app/src/remote_access/tailscale/TailscaleBox.cpp"
+    "${REPO_ROOT}/extern/wg-nx/library/crypto/monocypher.c")
+target_include_directories(tailscale_box_test PRIVATE
+    "${REPO_ROOT}/app/src/remote_access/tailscale"
+    "${REPO_ROOT}/extern/wg-nx/library/crypto")
+target_compile_features(tailscale_box_test PRIVATE cxx_std_20)
+add_test(NAME tailscale_box_test COMMAND tailscale_box_test)
 
 add_executable(tailscale_wgx_route_test
     "${REPO_ROOT}/tests/tailscale_wgx_route_test.cpp"

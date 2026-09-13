@@ -410,6 +410,7 @@ elseif (PLATFORM_SWITCH)
             endif ()
         endforeach ()
         list(APPEND MAIN_SRC
+            app/src/remote_access/tailscale/TailscaleBox.cpp
             app/src/remote_access/tailscale/TailscaleControlCodec.cpp
             app/src/remote_access/tailscale/TailscaleControlKey.cpp
             app/src/remote_access/tailscale/TailscaleControlSession.cpp

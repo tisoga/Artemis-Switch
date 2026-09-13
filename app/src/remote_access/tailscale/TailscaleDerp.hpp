@@ -65,7 +65,8 @@ private:
     std::vector<std::uint8_t> buffer_;
 };
 
-// ponytail: crypto ceiling is X25519 ECDH + XChaCha20-Poly1305 with 24B nonce; upgrade to full XSalsa20-Poly1305 if upstream DERP rejects Chacha20.
+// NaCl crypto_box (XSalsa20-Poly1305) for the ClientInfo/ServerInfo
+// handshake and, through DerpCrypto, the relay framing auth envelope.
 class IDerpCrypto {
 public:
     virtual ~IDerpCrypto() = default;
