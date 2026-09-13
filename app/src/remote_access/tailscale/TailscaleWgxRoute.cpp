@@ -283,6 +283,12 @@ public:
             return false;
         }
 
+        // Publish the active peer BEFORE the blocking handshake below: replies
+        // arriving mid-handshake must inject against this id, otherwise the
+        // handshake can never complete and always burns the retry budget.
+        activePeerId_ = peerId;
+        activePeerIp_ = peerIp;
+
         // Start WireGuard tunnel now that peer is registered (peer_count > 0)
         if (!running_) {
             if (wgx_start(context_) != 0) {
@@ -309,8 +315,6 @@ public:
         logTsRoute(VpnFileLogger::Severity::Info,
                    "WireGuard handshake with peer completed");
 
-        activePeerId_ = peerId;
-        activePeerIp_ = peerIp;
         return true;
     }
 
@@ -504,6 +508,8 @@ public:
     void derpReader() {
         std::string error;
         bool firstPacketLogged = false;
+        bool foreignLogged = false;
+        bool shortLogged = false;
         while (derpRunning_) {
             auto* session = derp_.get();
             if (!session)
@@ -519,18 +525,37 @@ public:
             switch (frame->type) {
             case DerpFrameType::RecvPacket: {
                 const auto& payload = frame->payload;
-                if (payload.size() > kDerpKeyLen && context_ &&
-                    std::memcmp(payload.data(), peerNodeKey_.data(),
-                                kDerpKeyLen) == 0) {
-                    wgx_inject_encrypted(
-                        context_, activePeerId_.load(std::memory_order_acquire),
-                        payload.data() + kDerpKeyLen,
-                        payload.size() - kDerpKeyLen);
-                    if (!firstPacketLogged) {
-                        firstPacketLogged = true;
-                        logTsRoute(VpnFileLogger::Severity::Info,
-                                   "DERP relay delivering peer packets");
+                if (payload.size() <= kDerpKeyLen) {
+                    if (!shortLogged) {
+                        shortLogged = true;
+                        logTsRoute(VpnFileLogger::Severity::Warning,
+                                   "DERP relay sent a runt packet (" +
+                                       std::to_string(payload.size()) +
+                                       " bytes)");
                     }
+                    break;
+                }
+                if (!context_ ||
+                    std::memcmp(payload.data(), peerNodeKey_.data(),
+                                kDerpKeyLen) != 0) {
+                    // A packet from a node we are not talking to (stale
+                    // session, wrong peer key) — never inject it.
+                    if (!foreignLogged) {
+                        foreignLogged = true;
+                        logTsRoute(VpnFileLogger::Severity::Warning,
+                                   "DERP relay sent a packet from an unknown "
+                                   "node; ignoring");
+                    }
+                    break;
+                }
+                wgx_inject_encrypted(
+                    context_, activePeerId_.load(std::memory_order_acquire),
+                    payload.data() + kDerpKeyLen,
+                    payload.size() - kDerpKeyLen);
+                if (!firstPacketLogged) {
+                    firstPacketLogged = true;
+                    logTsRoute(VpnFileLogger::Severity::Info,
+                               "DERP relay delivering peer packets");
                 }
                 break;
             }
@@ -719,6 +744,13 @@ bool TailscaleWgxRoute::start(const RemoteRouteTarget& target,
         }
         peerKey = peer->nodeKey;
         homeDerpRegion = peer->homeDerp;
+#if defined(__SWITCH__) && defined(ENABLE_TAILSCALE)
+        logTsRoute(VpnFileLogger::Severity::Info,
+                   "peer " + target.peerId + ": online=" +
+                       (peer->online ? "yes" : "no") + " homeDerp=" +
+                       std::to_string(peer->homeDerp) + " endpoints=" +
+                       std::to_string(peer->endpoints.size()));
+#endif
     } else {
         if (error)
             *error = "Tailscale peer resolver is not configured";
