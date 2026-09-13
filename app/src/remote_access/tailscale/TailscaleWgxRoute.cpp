@@ -292,7 +292,22 @@ public:
             running_ = true;
         }
 
-        wgx_connect_peer(context_, peerId);
+        // Blocking handshake over the relay established above: sub-second
+        // when the peer is alive, bounded (~20s) when it is dead. A timeout
+        // fails the route with a clear error instead of blackholing the
+        // GameStream handshake that follows.
+        logTsRoute(VpnFileLogger::Severity::Info,
+                   "starting WireGuard handshake with peer");
+        if (wgx_connect_peer(context_, peerId) != 0) {
+            const std::string failure =
+                "WireGuard handshake with peer timed out over DERP";
+            if (error)
+                *error = failure;
+            logTsRoute(VpnFileLogger::Severity::Error, failure);
+            return false;
+        }
+        logTsRoute(VpnFileLogger::Severity::Info,
+                   "WireGuard handshake with peer completed");
 
         activePeerId_ = peerId;
         activePeerIp_ = peerIp;
@@ -715,6 +730,17 @@ bool TailscaleWgxRoute::start(const RemoteRouteTarget& target,
             return false;
     }
 
+    // The encrypted packet path must be relayed (DERP) BEFORE the WireGuard
+    // handshake runs: wg_connect_peer blocks until the handshake completes,
+    // and with no relay underneath it burns the whole retry budget (up to
+    // 90s) holding the route mutex. Advertising a route without a working
+    // relay is what used to blackhole GameStream handshakes into a hang.
+    const std::vector<DerpRegion> derpMap =
+        derpMapProvider_ ? derpMapProvider_() : std::vector<DerpRegion>{};
+    if (!backend_->ensureDerpRoute(peerKey, homeDerpRegion, derpMap,
+                                   localPrivateKey, error))
+        return false;
+
     uint32_t peerNumId = static_cast<uint32_t>(
         std::hash<std::string>{}(target.peerId) & 0x7FFFFFFF);
     if (peerNumId == 0)
@@ -722,15 +748,6 @@ bool TailscaleWgxRoute::start(const RemoteRouteTarget& target,
 
     if (!backend_->addOrUpdatePeer(peerNumId, peerKey, target.peerAddress,
                                    error))
-        return false;
-
-    // The encrypted packet path must be relayed (DERP) before any proxy
-    // listener is opened. Advertising a route without a working relay is what
-    // used to blackhole GameStream handshakes into a hang.
-    const std::vector<DerpRegion> derpMap =
-        derpMapProvider_ ? derpMapProvider_() : std::vector<DerpRegion>{};
-    if (!backend_->ensureDerpRoute(peerKey, homeDerpRegion, derpMap,
-                                   localPrivateKey, error))
         return false;
 
     if (!backend_->startTcpProxy(target.peerAddress, kTailscaleTcpPorts, error))
