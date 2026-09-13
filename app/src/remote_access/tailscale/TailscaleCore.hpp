@@ -63,6 +63,7 @@ public:
     bool prepareRouteForStreaming(const RemoteRouteTarget& target);
     void deactivateRoute(const RemoteRouteTarget& target) noexcept;
     [[nodiscard]] RemotePathInfo pathInfo(std::string_view peerId) const;
+    [[nodiscard]] std::optional<Identity> identity() const;
 
     // Portable integration seam for decoded full maps and incremental updates.
     bool replacePeers(std::vector<Peer> peers, std::string localAddress,
@@ -81,6 +82,8 @@ private:
     PeerDirectory peers_;
     PathManager paths_;
 
+    mutable std::mutex identityMutex_;
+    std::optional<Identity> identity_;
     mutable std::mutex snapshotMutex_;
     Snapshot snapshot_;
     std::mutex routeMutex_;

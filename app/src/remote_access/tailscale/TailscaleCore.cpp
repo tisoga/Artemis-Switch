@@ -1,3 +1,22 @@
+
+#if defined(__SWITCH__)
+#include "../../utils/Settings.hpp"
+#include "../../vpn/VpnFileLogger.hpp"
+namespace {
+void logTsCore(VpnFileLogger::Severity severity, std::string_view message) {
+    VpnFileLogger::append(Settings::instance().working_dir() + "/vpn.log",
+                          "TS", severity, message);
+}
+}
+#define LOG_CORE_INFO(msg) logTsCore(VpnFileLogger::Severity::Info, msg)
+#define LOG_CORE_WARN(msg) logTsCore(VpnFileLogger::Severity::Warning, msg)
+#define LOG_CORE_ERROR(msg) logTsCore(VpnFileLogger::Severity::Error, msg)
+#else
+#define LOG_CORE_INFO(msg) do {} while(0)
+#define LOG_CORE_WARN(msg) do {} while(0)
+#define LOG_CORE_ERROR(msg) do {} while(0)
+#endif
+#include "TailscaleWgxRoute.hpp"
 #include "TailscaleCore.hpp"
 
 #include <chrono>
@@ -11,7 +30,22 @@ TailscaleCore::TailscaleCore(std::filesystem::path statePath,
                              IdentityGenerator identityGenerator)
     : stateStore_(std::move(statePath)), control_(std::move(control)),
       overlay_(std::move(overlay)),
-      identityGenerator_(std::move(identityGenerator)) {}
+      identityGenerator_(std::move(identityGenerator)) {
+    if (auto* wgxRoute = dynamic_cast<TailscaleWgxRoute*>(overlay_.get())) {
+        wgxRoute->setPeerResolver([this](std::string_view peerId) {
+            return peers_.findByStableId(peerId);
+        });
+        wgxRoute->setLocalInfoProvider([this]() -> std::optional<std::pair<std::string, Key32>> {
+            std::lock_guard lock(snapshotMutex_);
+            if (snapshot_.localAddress.empty())
+                return std::nullopt;
+            std::lock_guard idLock(identityMutex_);
+            if (!identity_)
+                return std::nullopt;
+            return std::make_pair(snapshot_.localAddress, identity_->nodePrivate);
+        });
+    }
+}
 
 TailscaleCore::~TailscaleCore() { stop(); }
 
@@ -91,6 +125,11 @@ void TailscaleCore::deactivateRoute(const RemoteRouteTarget& target) noexcept {
     }
 }
 
+std::optional<Identity> TailscaleCore::identity() const {
+    std::lock_guard lock(identityMutex_);
+    return identity_;
+}
+
 RemotePathInfo TailscaleCore::pathInfo(std::string_view peerId) const {
     return paths_.pathInfo(peerId);
 }
@@ -143,6 +182,10 @@ void TailscaleCore::workerMain(SecureBytes authKey, SecureBytes passphrase) {
         }
         identity = generated;
     }
+    {
+        std::lock_guard lock(identityMutex_);
+        identity_ = identity;
+    }
     passphrase.clear();
 
     if (!control_) {
@@ -151,6 +194,7 @@ void TailscaleCore::workerMain(SecureBytes authKey, SecureBytes passphrase) {
         return;
     }
     setState(Snapshot::State::ConnectingControl, "Connecting control");
+    LOG_CORE_INFO("Attempting control connection...");
     const bool hadAuthKey = !authKey.view().empty();
     if (!control_->connect(*identity, authKey.view(), &error)) {
         authKey.clear();
@@ -161,17 +205,23 @@ void TailscaleCore::workerMain(SecureBytes authKey, SecureBytes passphrase) {
     }
     authKey.clear();
     setState(Snapshot::State::ConnectedControl, "Control connected");
+    LOG_CORE_INFO("control connect succeeded. Polling netmap stream...");
 
     while (!stopRequested_) {
         PeerDelta delta;
         std::optional<std::vector<Peer>> fullPeers;
         std::string localAddress;
         if (!control_->poll(&delta, &fullPeers, &localAddress, &error)) {
+            LOG_CORE_ERROR("control poll failed: " + error);
             if (!stopRequested_)
                 setState(Snapshot::State::Error, "Control disconnected", error);
             break;
         }
+        if (!localAddress.empty()) {
+            LOG_CORE_INFO("Assigned local VPN address: " + localAddress);
+        }
         if (fullPeers) {
+            LOG_CORE_INFO("Received full netmap with " + std::to_string(fullPeers->size()) + " peers");
             if (!replacePeers(std::move(*fullPeers), localAddress, &error)) {
                 if (!stopRequested_)
                     setState(Snapshot::State::Error, "Netmap rejected", error);

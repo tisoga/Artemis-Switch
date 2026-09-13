@@ -9,6 +9,7 @@ using namespace artemis::tailscale;
 
 int main() {
     RegisterRequestData registration;
+    registration.capabilityVersion = 0;
     registration.nodePublic.fill(7);
     registration.authKey = "tskey-auth-test";
     assert(encodeRegisterRequest(registration).empty());
@@ -21,6 +22,7 @@ int main() {
            std::string::npos);
 
     MapRequestData request;
+    request.capabilityVersion = 0;
     request.nodePublic.fill(1);
     request.discoPublic.fill(2);
     assert(encodeMapRequest(request).empty());

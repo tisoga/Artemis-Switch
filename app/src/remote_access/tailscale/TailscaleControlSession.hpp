@@ -3,6 +3,7 @@
 #include "TailscaleControlCodec.hpp"
 #include "TailscaleCore.hpp"
 #include "TailscaleNoise.hpp"
+#include "TailscaleHttp2.hpp"
 #include "TailscaleTransport.hpp"
 
 #include <cstdint>
@@ -53,6 +54,9 @@ private:
     RecordReader recordReader_;
     std::vector<std::vector<std::uint8_t>> plaintextQueue_;
     MapCodec mapCodec_;
+    MapFrameDecoder mapFrameDecoder_;
+    Http2FrameDecoder http2Decoder_;
+    std::string dataAccumulator_;
     bool ready_ = false;
 };
 

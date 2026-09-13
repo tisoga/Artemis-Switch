@@ -1,6 +1,33 @@
 #include "TailscaleDerp.hpp"
 
+extern "C" {
+#include <monocypher.h>
+}
+
+#include <algorithm>
 #include <cstring>
+
+#if defined(__SWITCH__)
+extern "C" {
+void tailscale_internal_crypto_wipe(void*, size_t);
+void tailscale_internal_crypto_x25519(uint8_t[32], const uint8_t[32], const uint8_t[32]);
+void tailscale_internal_crypto_aead_lock(uint8_t*, uint8_t[16], const uint8_t[32],
+                                         const uint8_t[24], const uint8_t*, size_t,
+                                         const uint8_t*, size_t);
+int tailscale_internal_crypto_aead_unlock(uint8_t*, const uint8_t[16], const uint8_t[32],
+                                          const uint8_t[24], const uint8_t*, size_t,
+                                          const uint8_t*, size_t);
+}
+#define TS_DERP_WIPE tailscale_internal_crypto_wipe
+#define TS_DERP_X25519 tailscale_internal_crypto_x25519
+#define TS_DERP_LOCK tailscale_internal_crypto_aead_lock
+#define TS_DERP_UNLOCK tailscale_internal_crypto_aead_unlock
+#else
+#define TS_DERP_WIPE crypto_wipe
+#define TS_DERP_X25519 crypto_x25519
+#define TS_DERP_LOCK crypto_aead_lock
+#define TS_DERP_UNLOCK crypto_aead_unlock
+#endif
 
 namespace artemis::tailscale {
 
@@ -72,7 +99,7 @@ std::optional<DerpFrame> DerpCodec::take(std::string* error) {
             return std::nullopt;
         }
         if (buffer_.size() < kDerpFrameHeaderLen + *length)
-            return std::nullopt;  // wait for the rest of the frame
+            return std::nullopt;
         auto frame = parse(
             std::span<const std::uint8_t>(buffer_)
                 .first(kDerpFrameHeaderLen + *length),
@@ -86,13 +113,169 @@ std::optional<DerpFrame> DerpCodec::take(std::string* error) {
     return std::nullopt;
 }
 
+bool DerpCrypto::seal(std::span<const std::uint8_t> plainText,
+                      const Key32& myPrivate,
+                      const Key32& theirPublic,
+                      std::span<const std::uint8_t, kDerpNonceLen> nonce,
+                      std::vector<std::uint8_t>& cipherTextOut,
+                      std::string* error) {
+    Key32 sharedSecret{};
+    TS_DERP_X25519(sharedSecret.data(), myPrivate.data(), theirPublic.data());
+    const bool sharedZero = std::all_of(sharedSecret.begin(), sharedSecret.end(),
+                                        [](std::uint8_t b) { return b == 0; });
+    if (sharedZero) {
+        if (error) *error = "DERP crypto: weak or invalid X25519 shared secret";
+        return false;
+    }
+
+    cipherTextOut.resize(plainText.size() + kDerpTagLen);
+    std::uint8_t mac[kDerpTagLen]{};
+    TS_DERP_LOCK(cipherTextOut.data(), mac, sharedSecret.data(), nonce.data(),
+                 nullptr, 0, plainText.data(), plainText.size());
+    std::memcpy(cipherTextOut.data() + plainText.size(), mac, kDerpTagLen);
+    TS_DERP_WIPE(sharedSecret.data(), sharedSecret.size());
+    TS_DERP_WIPE(mac, sizeof(mac));
+    return true;
+}
+
+bool DerpCrypto::open(std::span<const std::uint8_t> cipherText,
+                      const Key32& myPrivate,
+                      const Key32& theirPublic,
+                      std::span<const std::uint8_t, kDerpNonceLen> nonce,
+                      std::vector<std::uint8_t>& plainTextOut,
+                      std::string* error) {
+    if (cipherText.size() < kDerpTagLen) {
+        if (error) *error = "DERP crypto: ciphertext shorter than auth tag";
+        return false;
+    }
+
+    Key32 sharedSecret{};
+    TS_DERP_X25519(sharedSecret.data(), myPrivate.data(), theirPublic.data());
+    const bool sharedZero = std::all_of(sharedSecret.begin(), sharedSecret.end(),
+                                        [](std::uint8_t b) { return b == 0; });
+    if (sharedZero) {
+        if (error) *error = "DERP crypto: weak or invalid X25519 shared secret";
+        return false;
+    }
+
+    const std::size_t plainSize = cipherText.size() - kDerpTagLen;
+    plainTextOut.resize(plainSize);
+    const std::uint8_t* mac = cipherText.data() + plainSize;
+
+    const int unlockRes =
+        TS_DERP_UNLOCK(plainTextOut.data(), mac, sharedSecret.data(),
+                       nonce.data(), nullptr, 0, cipherText.data(), plainSize);
+    TS_DERP_WIPE(sharedSecret.data(), sharedSecret.size());
+    if (unlockRes != 0) {
+        plainTextOut.clear();
+        if (error) *error = "DERP crypto: ciphertext authentication failed";
+        return false;
+    }
+    return true;
+}
+
+DerpSession::DerpSession(std::unique_ptr<ITransport> transport,
+                         Key32 clientPrivate,
+                         Key32 clientPublic,
+                         std::shared_ptr<IDerpCrypto> crypto)
+    : transport_(std::move(transport)),
+      clientPrivate_(clientPrivate),
+      clientPublic_(clientPublic),
+      crypto_(std::move(crypto)) {
+    if (!crypto_)
+        crypto_ = std::make_shared<DerpCrypto>();
+}
+
 bool DerpSession::connect(std::string* error) {
-    // The naclbox ClientInfo/ServerInfo relay handshake is not implemented, so
-    // a session must never be treated as usable. Fail closed with a reason.
-    if (error)
-        *error =
-            "DERP relay handshake is not implemented; refusing to open";
-    return false;
+    if (error) error->clear();
+    if (!transport_) {
+        if (error) *error = "DERP transport is not open";
+        return false;
+    }
+    const bool keyMissing =
+        std::all_of(clientPrivate_.begin(), clientPrivate_.end(),
+                    [](std::uint8_t b) { return b == 0; });
+    if (keyMissing) {
+        if (error)
+            *error = "DERP relay requires valid client node key; refusing to open";
+        return false;
+    }
+
+    // Step 1: Wait for ServerKey greeting
+    auto greeting = recvFrame(error);
+    if (!greeting) {
+        if (error && error->empty())
+            *error = "DERP connect: failed to receive server greeting";
+        return false;
+    }
+    if (greeting->type != DerpFrameType::ServerKey ||
+        greeting->payload.size() < kDerpMagic.size() + kDerpKeyLen) {
+        if (error)
+            *error = "DERP connect: invalid ServerKey greeting";
+        return false;
+    }
+    if (std::memcmp(greeting->payload.data(), kDerpMagic.data(),
+                    kDerpMagic.size()) != 0) {
+        if (error)
+            *error = "DERP connect: invalid magic in ServerKey greeting";
+        return false;
+    }
+    std::copy_n(greeting->payload.begin() + kDerpMagic.size(), kDerpKeyLen,
+                serverKey_.begin());
+
+    // Step 2: Send ClientInfo frame
+    std::array<std::uint8_t, kDerpNonceLen> clientNonce{};
+    for (std::size_t i = 0; i < clientNonce.size(); ++i)
+        clientNonce[i] = static_cast<std::uint8_t>(0x3C ^ (i * 5 + 1));
+
+    const std::string clientInfoJson = R"({"version":2})";
+    std::vector<std::uint8_t> sealedClientInfo;
+    if (!crypto_->seal(
+            std::span<const std::uint8_t>(
+                reinterpret_cast<const std::uint8_t*>(clientInfoJson.data()),
+                clientInfoJson.size()),
+            clientPrivate_, serverKey_, clientNonce, sealedClientInfo, error)) {
+        return false;
+    }
+
+    std::vector<std::uint8_t> clientPayload;
+    clientPayload.reserve(kDerpKeyLen + kDerpNonceLen + sealedClientInfo.size());
+    clientPayload.insert(clientPayload.end(), clientPublic_.begin(), clientPublic_.end());
+    clientPayload.insert(clientPayload.end(), clientNonce.begin(), clientNonce.end());
+    clientPayload.insert(clientPayload.end(), sealedClientInfo.begin(), sealedClientInfo.end());
+
+    if (!writeRaw(DerpFrameType::ClientInfo, clientPayload, error))
+        return false;
+
+    // Step 3: Receive ServerInfo frame
+    auto serverInfo = recvFrame(error);
+    if (!serverInfo) {
+        if (error && error->empty())
+            *error = "DERP connect: failed to receive ServerInfo";
+        return false;
+    }
+    if (serverInfo->type != DerpFrameType::ServerInfo ||
+        serverInfo->payload.size() < kDerpNonceLen + kDerpTagLen) {
+        if (error)
+            *error = "DERP connect: invalid ServerInfo frame";
+        return false;
+    }
+
+    std::array<std::uint8_t, kDerpNonceLen> serverNonce{};
+    std::copy_n(serverInfo->payload.begin(), kDerpNonceLen, serverNonce.begin());
+
+    std::span<const std::uint8_t> serverCiphertext(
+        serverInfo->payload.data() + kDerpNonceLen,
+        serverInfo->payload.size() - kDerpNonceLen);
+    std::vector<std::uint8_t> decryptedInfo;
+
+    if (!crypto_->open(serverCiphertext, clientPrivate_, serverKey_,
+                       serverNonce, decryptedInfo, error)) {
+        return false;
+    }
+
+    connected_ = true;
+    return true;
 }
 
 bool DerpSession::sendPacket(std::span<const std::uint8_t> destKey,
@@ -159,7 +342,16 @@ bool DerpSession::writeRaw(DerpFrameType type,
 }
 
 void DerpSession::close() noexcept {
+    connected_ = false;
     if (transport_) transport_->close();
+}
+
+bool DerpSession::isConnected() const noexcept {
+    return connected_;
+}
+
+Key32 DerpSession::serverKey() const noexcept {
+    return serverKey_;
 }
 
 } // namespace artemis::tailscale

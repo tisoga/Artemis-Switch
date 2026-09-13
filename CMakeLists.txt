@@ -111,7 +111,7 @@ endif ()
 if (PLATFORM_SWITCH)
     option(ENABLE_WIREGUARD "Enable WireGuard support" ON)
     option(ENABLE_NETBIRD "Enable NetBird VPN support" ON)
-    option(ENABLE_TAILSCALE "Enable experimental Tailscale support" OFF)
+    option(ENABLE_TAILSCALE "Enable experimental Tailscale support" ON)
 else ()
     set(ENABLE_WIREGUARD OFF)
     set(ENABLE_NETBIRD OFF)
@@ -415,6 +415,7 @@ elseif (PLATFORM_SWITCH)
             app/src/remote_access/tailscale/TailscaleControlSession.cpp
             app/src/remote_access/tailscale/TailscaleDerp.cpp
             app/src/remote_access/tailscale/TailscaleHttpUpgrade.cpp
+            app/src/remote_access/tailscale/TailscaleHttp2.cpp
             app/src/remote_access/tailscale/TailscaleNoise.cpp
             app/src/remote_access/tailscale/TailscalePathManager.cpp
             app/src/remote_access/tailscale/TailscalePeerDirectory.cpp
