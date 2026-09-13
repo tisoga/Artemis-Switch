@@ -5,6 +5,8 @@
 extern "C" {
 #include "wgx.h"
 #include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 }
 #include "TailscaleDerp.hpp"
 #include "TailscaleTransport.hpp"
