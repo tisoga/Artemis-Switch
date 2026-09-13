@@ -230,6 +230,25 @@ public:
     void sendEgress(const void* packet, size_t length) {
         if (length > kDerpMaxPacketSize)
             return;
+        // WireGuard message header: one LE u32 type (1 initiation, 2
+        // response, 3 cookie, 4 transport). Logged once per type so a
+        // malformed stack shows up in vpn.log instead of silent drops.
+        if (length >= 4) {
+            const auto* bytes = static_cast<const std::uint8_t*>(packet);
+            const std::uint32_t msgType =
+                static_cast<std::uint32_t>(bytes[0]) |
+                (static_cast<std::uint32_t>(bytes[1]) << 8U) |
+                (static_cast<std::uint32_t>(bytes[2]) << 16U) |
+                (static_cast<std::uint32_t>(bytes[3]) << 24U);
+            const unsigned slot = msgType < 8 ? msgType : 0;
+            if (!egressTypes_[slot]) {
+                egressTypes_[slot] = true;
+                logTsRoute(VpnFileLogger::Severity::Info,
+                           "DERP relay sending WireGuard type=" +
+                               std::to_string(msgType) + " len=" +
+                               std::to_string(length));
+            }
+        }
         std::lock_guard lock(derpWriteMutex_);
         if (!derpAlive_ || !derp_ || !havePeer_)
             return;
@@ -630,6 +649,8 @@ public:
         derpAlive_ = false;
         havePeer_ = false;
         egressLogged_ = false;
+        for (auto& seen : egressTypes_)
+            seen = false;
         activeDerpRegion_ = 0;
         activeDerpHost_.clear();
     }
@@ -678,6 +699,7 @@ private:
     Key32 peerNodeKey_{};
     bool havePeer_ = false;
     bool egressLogged_ = false;
+    bool egressTypes_[8] = {false};
     int activeDerpRegion_ = 0;
     std::string activeDerpHost_;
 };
