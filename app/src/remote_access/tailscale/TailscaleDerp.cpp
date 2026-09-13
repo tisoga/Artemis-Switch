@@ -5,6 +5,7 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 
 #if defined(__SWITCH__)
@@ -32,6 +33,7 @@ int tailscale_internal_crypto_aead_unlock(uint8_t*, const uint8_t[16], const uin
 namespace artemis::tailscale {
 
 namespace {
+
 void writeBigEndian32(std::vector<std::uint8_t>& out, std::uint32_t value) {
     out.push_back(static_cast<std::uint8_t>(value >> 24U));
     out.push_back(static_cast<std::uint8_t>((value >> 16U) & 0xffU));
@@ -352,6 +354,61 @@ bool DerpSession::isConnected() const noexcept {
 
 Key32 DerpSession::serverKey() const noexcept {
     return serverKey_;
+}
+
+std::string buildDerpUpgradeRequest(std::string_view host) {
+    std::string request = "GET /derp HTTP/1.1\r\nHost: ";
+    request.append(host.data(), host.size());
+    request.append("\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n"
+                   "User-Agent: artemis-switch\r\n\r\n");
+    return request;
+}
+
+bool validateDerpUpgradeResponse(std::string_view header, std::string* error) {
+    if (header.size() < 16 || header.substr(header.size() - 4) != "\r\n\r\n") {
+        if (error) *error = "DERP upgrade response is incomplete";
+        return false;
+    }
+    const auto statusEnd = header.find("\r\n");
+    if (statusEnd == std::string_view::npos) {
+        if (error) *error = "DERP upgrade response has no status line";
+        return false;
+    }
+    const std::string_view status = header.substr(0, statusEnd);
+    const bool http11 = status.starts_with("HTTP/1.1 ");
+    const bool http10 = status.starts_with("HTTP/1.0 ");
+    const bool is101 = status.size() >= 12 && status.substr(9, 3) == "101";
+    if (!(http11 || http10) || !is101) {
+        if (error)
+            *error = "DERP upgrade rejected: " + std::string(status);
+        return false;
+    }
+    // Scan header lines for an Upgrade token naming DERP. Token matching is
+    // case-insensitive and tolerates comma-separated extras.
+    std::string_view rest = header.substr(statusEnd + 2);
+    while (!rest.empty()) {
+        const auto lineEnd = rest.find("\r\n");
+        const std::string_view line =
+            lineEnd == std::string_view::npos ? rest : rest.substr(0, lineEnd);
+        const auto colon = line.find(':');
+        if (colon != std::string_view::npos) {
+            std::string name(line.substr(0, colon));
+            std::transform(name.begin(), name.end(), name.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            if (name == "upgrade") {
+                std::string value(line.substr(colon + 1));
+                std::transform(value.begin(), value.end(), value.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                if (value.find("derp") != std::string::npos)
+                    return true;
+            }
+        }
+        if (lineEnd == std::string_view::npos)
+            break;
+        rest.remove_prefix(lineEnd + 2);
+    }
+    if (error) *error = "DERP upgrade response lacks an Upgrade: DERP header";
+    return false;
 }
 
 } // namespace artemis::tailscale

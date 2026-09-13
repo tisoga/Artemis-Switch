@@ -27,7 +27,9 @@ public:
     // peers that left the tailnet are really removed rather than lingering.
     virtual bool poll(PeerDelta* delta,
                       std::optional<std::vector<Peer>>* fullPeers,
-                      std::string* localAddress, std::string* error) = 0;
+                      std::string* localAddress,
+                      std::optional<std::vector<DerpRegion>>* derpMap,
+                      std::string* error) = 0;
     virtual void close() noexcept = 0;
 };
 
@@ -69,6 +71,9 @@ public:
     bool replacePeers(std::vector<Peer> peers, std::string localAddress,
                       std::string* error = nullptr);
     bool applyPeerDelta(const PeerDelta& delta, std::string* error = nullptr);
+    // Stores the latest control-plane DERP region map. Only frames that carry
+    // a DERPMap section update it; deltas leave the stored map untouched.
+    void updateDerpMap(std::vector<DerpRegion> regions);
 
 private:
     void workerMain(SecureBytes authKey, SecureBytes passphrase);

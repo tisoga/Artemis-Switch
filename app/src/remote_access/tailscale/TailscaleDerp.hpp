@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace artemis::tailscale {
@@ -97,6 +98,20 @@ public:
               std::vector<std::uint8_t>& plainTextOut,
               std::string* error) override;
 };
+
+// Builds the plain-HTTP upgrade request that turns a connected (usually TLS)
+// byte stream into a DERP frame stream: `GET /derp` with `Upgrade: DERP`.
+// The caller writes the result, reads the response header through the first
+// CRLF CRLF, and validates it with validateDerpUpgradeResponse before handing
+// the transport to DerpSession.
+std::string buildDerpUpgradeRequest(std::string_view host);
+
+// Validates the complete HTTP response header (through CRLF CRLF) to a DERP
+// upgrade request: status 101 plus an Upgrade token naming DERP
+// (case-insensitive, tolerant of extra tokens for headscale compatibility).
+// No response body is permitted before DERP framing begins.
+bool validateDerpUpgradeResponse(std::string_view header,
+                                 std::string* error = nullptr);
 
 class DerpSession {
 public:

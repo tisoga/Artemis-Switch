@@ -228,5 +228,31 @@ int main() {
         assert(!session.isConnected());
     }
 
+    // 8. DERP HTTP upgrade: request shape and response validation.
+    {
+        const auto request = artemis::tailscale::buildDerpUpgradeRequest("derp1.example");
+        assert(request.starts_with("GET /derp HTTP/1.1\r\n"));
+        assert(request.find("Host: derp1.example\r\n") != std::string::npos);
+        assert(request.find("Upgrade: DERP\r\n") != std::string::npos);
+        assert(request.ends_with("\r\n\r\n"));
+
+        std::string error;
+        assert(artemis::tailscale::validateDerpUpgradeResponse(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: DERP\r\n"
+            "Connection: Upgrade\r\n\r\n",
+            &error));
+        // Header-name case and extra upgrade tokens are tolerated.
+        assert(artemis::tailscale::validateDerpUpgradeResponse(
+            "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket, Derp\r\n\r\n",
+            &error));
+        assert(!artemis::tailscale::validateDerpUpgradeResponse(
+            "HTTP/1.1 200 OK\r\nUpgrade: DERP\r\n\r\n", &error));
+        assert(!artemis::tailscale::validateDerpUpgradeResponse(
+            "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\r\n",
+            &error));
+        assert(!artemis::tailscale::validateDerpUpgradeResponse(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: DERP\r\n", &error));
+    }
+
     return 0;
 }

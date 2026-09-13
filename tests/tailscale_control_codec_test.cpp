@@ -92,5 +92,45 @@ int main() {
     assert(!decoder.take(&error));
     assert(decoder.append(std::span(framed).subspan(5), &error));
     assert(decoder.take(&error) == keepAlive);
+
+    // Frames without a DERPMap section leave the update empty-handed; the
+    // engine keeps its stored relay map.
+    assert(!update->derpMap.has_value());
+
+    // A DERPMap section decodes to relay regions. HostName wins over IPv4,
+    // DERPPort defaults to 443, and unusable regions are skipped.
+    const std::string withDerp =
+        "{\"Node\":{\"Addresses\":[\"100.64.0.2/32\"]},\"Peers\":[],"
+        "\"DERPMap\":{\"Regions\":{"
+        "\"1\":{\"RegionID\":1,\"RegionCode\":\"nyc\",\"Nodes\":["
+        "{\"Name\":\"1a\",\"RegionID\":1,\"HostName\":\"derp1.example\","
+        "\"IPv4\":\"203.0.2.1\",\"DERPPort\":443},"
+        "{\"Name\":\"1b\",\"RegionID\":1,\"IPv4\":\"203.0.2.2\"}]},"
+        "\"2\":{\"RegionID\":2,\"RegionCode\":\"fra\",\"Nodes\":["
+        "{\"Name\":\"2a\",\"RegionID\":2,\"HostName\":\"derp2.example\","
+        "\"DERPPort\":8443}]},"
+        "\"3\":{\"RegionID\":3,\"RegionCode\":\"empty\",\"Nodes\":["
+        "{\"Name\":\"3a\",\"RegionID\":3}]}}}}";
+    const auto derpUpdate = codec.decode(withDerp, &error);
+    assert(derpUpdate && derpUpdate->derpMap.has_value());
+    assert(derpUpdate->derpMap->size() == 2);
+    const DerpRegion* nyc = nullptr;
+    const DerpRegion* fra = nullptr;
+    for (const auto& region : *derpUpdate->derpMap) {
+        if (region.regionId == 1) nyc = &region;
+        if (region.regionId == 2) fra = &region;
+    }
+    assert(nyc && nyc->regionCode == "nyc" && nyc->nodes.size() == 2);
+    assert(nyc->nodes[0].host == "derp1.example" && nyc->nodes[0].port == 443);
+    assert(nyc->nodes[1].host == "203.0.2.2" && nyc->nodes[1].port == 443);
+    assert(fra && fra->nodes.size() == 1);
+    assert(fra->nodes[0].host == "derp2.example" && fra->nodes[0].port == 8443);
+
+    // A malformed DERPMap section fails the update rather than installing a
+    // half-parsed relay map the data path would then trust.
+    assert(!codec.decode("{\"DERPMap\":{\"Regions\":[]}}", &error));
+    assert(error == "netmap DERPMap.Regions is not an object");
+    assert(!codec.decode("{\"DERPMap\":[]}", &error));
+    assert(error == "netmap DERPMap is not an object");
     return 0;
 }

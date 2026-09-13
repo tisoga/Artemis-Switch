@@ -47,6 +47,20 @@ struct PeerDelta {
     std::vector<std::string> removedStableIds;
 };
 
+// A DERP relay region from the control plane's DERPMap. The relay address a
+// client dials is resolved per node: HostName when present, otherwise the
+// literal IPv4. Ports default to 443 when the map omits them.
+struct DerpNode {
+    std::string host;
+    std::uint16_t port = 443;
+};
+
+struct DerpRegion {
+    int regionId = 0;
+    std::string regionCode;
+    std::vector<DerpNode> nodes;
+};
+
 struct Snapshot {
     enum class State {
         Stopped,
@@ -61,6 +75,7 @@ struct Snapshot {
     State state = State::Stopped;
     std::string localAddress;
     std::vector<Peer> peers;
+    std::vector<DerpRegion> derpMap;
     std::string status;
     std::string lastError;
 };

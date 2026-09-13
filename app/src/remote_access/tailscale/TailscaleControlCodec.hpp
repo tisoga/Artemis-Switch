@@ -34,6 +34,9 @@ struct MapUpdate {
     std::string localAddress;
     std::optional<std::vector<Peer>> fullPeers;
     PeerDelta delta;
+    // Present only when the frame carried a DERPMap section. Deltas normally
+    // omit it, in which case the engine keeps the last full map.
+    std::optional<std::vector<DerpRegion>> derpMap;
 };
 
 // Tailscale JSON keys use a typed prefix followed by exactly 32 bytes encoded

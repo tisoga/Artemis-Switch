@@ -44,6 +44,10 @@ TailscaleCore::TailscaleCore(std::filesystem::path statePath,
                 return std::nullopt;
             return std::make_pair(snapshot_.localAddress, identity_->nodePrivate);
         });
+        wgxRoute->setDerpMapProvider([this]() {
+            std::lock_guard lock(snapshotMutex_);
+            return snapshot_.derpMap;
+        });
     }
 }
 
@@ -158,6 +162,11 @@ bool TailscaleCore::applyPeerDelta(const PeerDelta& delta,
     return peers_.apply(delta, error);
 }
 
+void TailscaleCore::updateDerpMap(std::vector<DerpRegion> regions) {
+    std::lock_guard lock(snapshotMutex_);
+    snapshot_.derpMap = std::move(regions);
+}
+
 void TailscaleCore::workerMain(SecureBytes authKey, SecureBytes passphrase) {
     std::string error;
     auto identity = stateStore_.load(passphrase.view(), &error);
@@ -211,7 +220,8 @@ void TailscaleCore::workerMain(SecureBytes authKey, SecureBytes passphrase) {
         PeerDelta delta;
         std::optional<std::vector<Peer>> fullPeers;
         std::string localAddress;
-        if (!control_->poll(&delta, &fullPeers, &localAddress, &error)) {
+        std::optional<std::vector<DerpRegion>> derpMap;
+        if (!control_->poll(&delta, &fullPeers, &localAddress, &derpMap, &error)) {
             LOG_CORE_ERROR("control poll failed: " + error);
             if (!stopRequested_)
                 setState(Snapshot::State::Error, "Control disconnected", error);
@@ -227,10 +237,16 @@ void TailscaleCore::workerMain(SecureBytes authKey, SecureBytes passphrase) {
                     setState(Snapshot::State::Error, "Netmap rejected", error);
                 break;
             }
+            if (derpMap) {
+                updateDerpMap(std::move(*derpMap));
+                LOG_CORE_INFO("Stored DERP region map");
+            }
             continue;
         }
         if (!delta.changed.empty() || !delta.removedStableIds.empty())
             peers_.apply(delta, &error);
+        if (derpMap)
+            updateDerpMap(std::move(*derpMap));
         if (!localAddress.empty()) {
             std::lock_guard lock(snapshotMutex_);
             snapshot_.localAddress = std::move(localAddress);

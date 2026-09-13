@@ -38,7 +38,9 @@ public:
                  std::span<const std::uint8_t> authKey,
                  std::string* error) override;
     bool poll(PeerDelta* delta, std::optional<std::vector<Peer>>* fullPeers,
-              std::string* localAddress, std::string* error) override;
+              std::string* localAddress,
+              std::optional<std::vector<DerpRegion>>* derpMap,
+              std::string* error) override;
     void close() noexcept override;
 
 private:

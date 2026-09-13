@@ -5,12 +5,22 @@
 extern "C" {
 #include "wgx.h"
 #include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <fcntl.h>
 }
+#include "TailscaleDerp.hpp"
+#include "TailscaleTransport.hpp"
 #include "../../vpn/SocketFdLock.hpp"
 #include <wg_lwip_relay.hpp>
+
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <thread>
+
+// Same shim pattern as TailscaleControlSession: the Switch build links
+// X25519 through wg-nx rather than monocypher directly.
+extern "C" {
+void tailscale_internal_crypto_x25519_public_key(uint8_t[32], const uint8_t[32]);
+}
 #endif
 
 #include <algorithm>
@@ -116,17 +126,48 @@ void SimulatedWgxBackend::stopUdpRelay() noexcept {
     udpPorts_.clear();
 }
 
+bool SimulatedWgxBackend::ensureDerpRoute(const Key32& peerNodeKey,
+                                          int homeDerpRegion,
+                                          const std::vector<DerpRegion>& derpMap,
+                                          const Key32& localPrivateKey,
+                                          std::string* error) {
+    (void)derpMap;
+    (void)localPrivateKey;
+    if (!running_) {
+        if (error)
+            *error = "Simulated backend: tunnel not running";
+        return false;
+    }
+    const bool keyZero =
+        std::all_of(peerNodeKey.begin(), peerNodeKey.end(),
+                    [](std::uint8_t byte) { return byte == 0; });
+    if (keyZero) {
+        if (error)
+            *error = "Simulated backend: peer node key is uninitialized";
+        return false;
+    }
+    if (homeDerpRegion <= 0) {
+        if (error)
+            *error = "Simulated backend: peer has no home DERP region";
+        return false;
+    }
+    derpReady_ = true;
+    return true;
+}
+
 void SimulatedWgxBackend::stop() noexcept {
     stopUdpRelay();
     tcpActive_ = false;
     tcpPorts_.clear();
     running_ = false;
+    derpReady_ = false;
     activePeerIp_.clear();
 }
 
 bool SimulatedWgxBackend::isRunning() const noexcept { return running_; }
 bool SimulatedWgxBackend::isTcpActive() const noexcept { return tcpActive_; }
 bool SimulatedWgxBackend::isUdpActive() const noexcept { return udpActive_; }
+bool SimulatedWgxBackend::isDerpReady() const noexcept { return derpReady_; }
 
 
 #if defined(__SWITCH__) && defined(ENABLE_TAILSCALE)
@@ -134,6 +175,31 @@ bool SimulatedWgxBackend::isUdpActive() const noexcept { return udpActive_; }
 namespace {
 void realIngressCallback(void*, const void*, size_t) {}
 void tailscaleRelayLog(wgnx::LogLevel, const char*) {}
+
+// Bounded byte-wise HTTP response header reader for the DERP upgrade.
+// Mirrors the control session's reader; the header ends at the first CRLFCRLF.
+bool readDerpUpgradeHeader(ITransport& transport, std::string* header,
+                           std::string* error) {
+    constexpr std::size_t kMaxHeader = 16 * 1024;
+    header->clear();
+    std::array<std::uint8_t, 1> byte{};
+    while (header->size() < kMaxHeader) {
+        const int received = transport.read(byte.data(), 1, error);
+        if (received < 0)
+            return false;
+        if (received == 0) {
+            if (error)
+                *error = "DERP connection closed during HTTP upgrade";
+            return false;
+        }
+        header->push_back(static_cast<char>(byte[0]));
+        if (header->ends_with("\r\n\r\n"))
+            return true;
+    }
+    if (error)
+        *error = "oversized DERP upgrade response";
+    return false;
+}
 } // namespace
 
 class RealWgxBackend final : public IWgxBackend {
@@ -142,18 +208,25 @@ public:
 
     static void realEgressCallback(void* user, uint32_t peer_id, const void* packet, size_t length) {
         auto* backend = static_cast<RealWgxBackend*>(user);
-        if (backend) {
-            backend->sendEgress(peer_id, packet, length);
-        }
+        // Single active peer: the relay destination is the node key captured
+        // at ensureDerpRoute time, not the wgx-internal numeric peer id.
+        (void)peer_id;
+        if (backend && packet && length > 0)
+            backend->sendEgress(packet, length);
     }
 
-    void sendEgress(uint32_t peerId, const void* packet, size_t length) {
-        (void)peerId;
-        if (udpSocket_ >= 0 && activePeerConfigured_) {
-            ::sendto(udpSocket_, packet, length, 0,
-                     reinterpret_cast<const sockaddr*>(&peerEndpoint_),
-                     sizeof(peerEndpoint_));
-        }
+    // WireGuard encrypted egress -> DERP SendPacket addressed by peer node key.
+    // Runs on the WireGuard worker thread: never blocks on anything except a
+    // short TLS write under its own mutex.
+    void sendEgress(const void* packet, size_t length) {
+        if (length > kDerpMaxPacketSize)
+            return;
+        std::lock_guard lock(derpWriteMutex_);
+        if (!derpAlive_ || !derp_ || !havePeer_)
+            return;
+        const auto* bytes = static_cast<const std::uint8_t*>(packet);
+        derp_->sendPacket(std::span<const std::uint8_t>(peerNodeKey_.data(), peerNodeKey_.size()),
+                          std::span<const std::uint8_t>(bytes, length), nullptr);
     }
 
     bool startTunnel(const Key32& privateKey, const std::string& localIp,
@@ -165,24 +238,10 @@ public:
             return false;
         }
 
-        udpSocket_ = static_cast<int>(::socket(AF_INET, SOCK_DGRAM, 0));
-        if (udpSocket_ >= 0) {
-            const int flags = fcntl(udpSocket_, F_GETFL, 0);
-            if (flags >= 0)
-                fcntl(udpSocket_, F_SETFL, flags | O_NONBLOCK);
-
-            struct sockaddr_in bindAddr{};
-            bindAddr.sin_family = AF_INET;
-            bindAddr.sin_addr.s_addr = INADDR_ANY;
-            bindAddr.sin_port = 0;
-            ::bind(udpSocket_, reinterpret_cast<sockaddr*>(&bindAddr), sizeof(bindAddr));
-        }
-
         context_ = wgx_create(privateKey.data(), localAddr.s_addr,
                               realEgressCallback, realIngressCallback, this);
         if (!context_) {
             if (error) *error = "wgx_create failed";
-            if (udpSocket_ >= 0) { ::close(udpSocket_); udpSocket_ = -1; }
             return false;
         }
 
@@ -216,19 +275,100 @@ public:
                 return false;
             }
             running_ = true;
-            rxThread_ = std::thread(&RealWgxBackend::rxWorker, this);
         }
 
         wgx_connect_peer(context_, peerId);
 
-        ::memset(&peerEndpoint_, 0, sizeof(peerEndpoint_));
-        peerEndpoint_.sin_family = AF_INET;
-        peerEndpoint_.sin_port = htons(41641); // Tailscale default WireGuard port
-        peerEndpoint_.sin_addr = peerAddr;
         activePeerId_ = peerId;
         activePeerIp_ = peerIp;
-        activePeerConfigured_ = true;
         return true;
+    }
+
+    bool ensureDerpRoute(const Key32& peerNodeKey, int homeDerpRegion,
+                         const std::vector<DerpRegion>& derpMap,
+                         const Key32& localPrivateKey,
+                         std::string* error) override {
+        const bool peerKeyZero =
+            std::all_of(peerNodeKey.begin(), peerNodeKey.end(),
+                        [](std::uint8_t byte) { return byte == 0; });
+        if (peerKeyZero) {
+            if (error) *error = "DERP route requires a valid peer node key";
+            return false;
+        }
+        const bool privateKeyZero =
+            std::all_of(localPrivateKey.begin(), localPrivateKey.end(),
+                        [](std::uint8_t byte) { return byte == 0; });
+        if (privateKeyZero) {
+            if (error)
+                *error = "DERP route requires the local node private key";
+            return false;
+        }
+        if (homeDerpRegion <= 0) {
+            if (error)
+                *error = "peer has no home DERP region; the control-plane "
+                         "netmap is incomplete";
+            return false;
+        }
+        const DerpRegion* region = nullptr;
+        for (const auto& candidate : derpMap) {
+            if (candidate.regionId == homeDerpRegion) {
+                region = &candidate;
+                break;
+            }
+        }
+        if (!region || region->nodes.empty()) {
+            if (error)
+                *error = "DERP region " + std::to_string(homeDerpRegion) +
+                         " is missing from the control-plane map; cannot relay";
+            return false;
+        }
+
+        // Already relaying for this peer through this region: keep the live
+        // session instead of flapping the relay on every route re-activation.
+        if (derpAlive_ && derp_ && havePeer_ &&
+            peerNodeKey_ == peerNodeKey &&
+            activeDerpRegion_ == homeDerpRegion)
+            return true;
+        stopDerp();
+
+        Key32 localPublic{};
+        tailscale_internal_crypto_x25519_public_key(localPublic.data(),
+                                                    localPrivateKey.data());
+
+        std::string lastError = "no DERP node attempted";
+        for (const auto& node : region->nodes) {
+            auto transport = std::make_unique<SwitchTlsTransport>();
+            if (!transport->connect(node.host, node.port, &lastError))
+                continue;
+            const std::string request = buildDerpUpgradeRequest(node.host);
+            const std::span<const std::uint8_t> requestBytes(
+                reinterpret_cast<const std::uint8_t*>(request.data()),
+                request.size());
+            if (!transport->write(requestBytes, &lastError))
+                continue;
+            std::string header;
+            if (!readDerpUpgradeHeader(*transport, &header, &lastError))
+                continue;
+            if (!validateDerpUpgradeResponse(header, &lastError))
+                continue;
+            auto session = std::make_unique<DerpSession>(
+                std::move(transport), localPrivateKey, localPublic);
+            if (!session->connect(&lastError))
+                continue;
+            derp_ = std::move(session);
+            peerNodeKey_ = peerNodeKey;
+            havePeer_ = true;
+            activeDerpRegion_ = homeDerpRegion;
+            activeDerpHost_ = node.host;
+            derpAlive_ = true;
+            derpRunning_ = true;
+            derpThread_ = std::thread(&RealWgxBackend::derpReader, this);
+            return true;
+        }
+        if (error)
+            *error = "DERP region " + std::to_string(homeDerpRegion) +
+                     " unreachable: " + lastError;
+        return false;
     }
 
     bool startTcpProxy(const std::string& peerIp,
@@ -294,36 +434,79 @@ public:
         udpPrepared_ = false;
     }
 
-    void rxWorker() {
-        while (running_) {
-            if (udpSocket_ >= 0 && context_ && activePeerId_ != 0) {
-                uint8_t buffer[2048];
-                sockaddr_in fromAddr{};
-                socklen_t fromLen = sizeof(fromAddr);
-                const ssize_t received = ::recvfrom(
-                    udpSocket_, buffer, sizeof(buffer), 0,
-                    reinterpret_cast<sockaddr*>(&fromAddr), &fromLen);
-                if (received > 0) {
-                    wgx_inject_encrypted(context_, activePeerId_, buffer,
-                                         static_cast<size_t>(received));
+    // DERP frame pump: the only thread that blocks in the relay transport.
+    // RecvPackets from the active peer are decrypted by DERP framing already
+    // (server-routed by node key) and handed to WireGuard as encrypted input.
+    // Ping frames are echoed so the relay keeps this client marked present.
+    // Any other frame type is protocol housekeeping and safely ignored here.
+    void derpReader() {
+        std::string error;
+        while (derpRunning_) {
+            auto* session = derp_.get();
+            if (!session)
+                break;
+            auto frame = session->recvFrame(&error);
+            if (!frame)
+                break;
+            switch (frame->type) {
+            case DerpFrameType::RecvPacket: {
+                const auto& payload = frame->payload;
+                if (payload.size() > kDerpKeyLen && context_ &&
+                    std::memcmp(payload.data(), peerNodeKey_.data(),
+                                kDerpKeyLen) == 0) {
+                    wgx_inject_encrypted(
+                        context_, activePeerId_.load(std::memory_order_acquire),
+                        payload.data() + kDerpKeyLen,
+                        payload.size() - kDerpKeyLen);
                 }
+                break;
             }
-            if (relay_) {
-                relay_->tick();
+            case DerpFrameType::Ping: {
+                std::lock_guard lock(derpWriteMutex_);
+                if (derpAlive_ && derp_)
+                    derp_->writeRaw(DerpFrameType::Pong, frame->payload,
+                                    nullptr);
+                break;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            case DerpFrameType::Pong:
+            case DerpFrameType::KeepAlive:
+            case DerpFrameType::PeerPresent:
+            case DerpFrameType::PeerGone:
+            case DerpFrameType::Health:
+            default:
+                break;
+            }
         }
+        // The relay is gone (or was never usable). Mark it dead so egress
+        // drops fast and the next route activation reconnects instead of
+        // stalling the WireGuard handshake into a UI hang.
+        derpAlive_ = false;
+    }
+
+    void stopDerp() noexcept {
+        derpRunning_ = false;
+        {
+            // Serialize against egress writes: closing the TLS connection
+            // while a SendPacket write is in flight corrupts the session.
+            std::lock_guard lock(derpWriteMutex_);
+            if (derp_)
+                derp_->close();
+        }
+        if (derpThread_.joinable())
+            derpThread_.join();
+        // The reader is gone; reset under the write mutex so a concurrent
+        // egress callback cannot observe half-torn relay state.
+        std::lock_guard lock(derpWriteMutex_);
+        derp_.reset();
+        derpAlive_ = false;
+        havePeer_ = false;
+        activeDerpRegion_ = 0;
+        activeDerpHost_.clear();
     }
 
     void stop() noexcept override {
+        stopDerp();
         running_ = false;
-        if (rxThread_.joinable()) {
-            rxThread_.join();
-        }
-        if (udpSocket_ >= 0) {
-            ::close(udpSocket_);
-            udpSocket_ = -1;
-        }
         if (relay_) {
             auto guard = SocketFdLock::instance().guard();
             relay_.reset();
@@ -336,7 +519,6 @@ public:
         localIp_.clear();
         activePeerIp_.clear();
         activePeerId_ = 0;
-        activePeerConfigured_ = false;
         udpPrepared_ = false;
     }
 
@@ -347,16 +529,26 @@ public:
 private:
     WgxContext* context_ = nullptr;
     std::unique_ptr<wgnx::LwipRelay> relay_;
-    int udpSocket_ = -1;
-    sockaddr_in peerEndpoint_{};
-    uint32_t activePeerId_ = 0;
-    bool activePeerConfigured_ = false;
+    // Written under the route mutex (addOrUpdatePeer/stop), read by the DERP
+    // pump thread: atomic so relay teardown never races packet injection.
+    std::atomic_uint32_t activePeerId_{0};
     bool tunnelCreated_ = false;
-    std::thread rxThread_;
     std::string localIp_;
     std::string activePeerIp_;
     std::atomic_bool running_ = false;
     bool udpPrepared_ = false;
+    // DERP relay state. derpWriteMutex_ serializes TLS writes between the
+    // WireGuard egress callback and Ping/Pong echoes; the reader thread is
+    // the only code that blocks in recvFrame.
+    std::unique_ptr<DerpSession> derp_;
+    std::thread derpThread_;
+    std::mutex derpWriteMutex_;
+    std::atomic_bool derpRunning_{false};
+    std::atomic_bool derpAlive_{false};
+    Key32 peerNodeKey_{};
+    bool havePeer_ = false;
+    int activeDerpRegion_ = 0;
+    std::string activeDerpHost_;
 };
 #endif
 
@@ -380,6 +572,11 @@ void TailscaleWgxRoute::setPeerResolver(PeerResolver resolver) {
 void TailscaleWgxRoute::setLocalInfoProvider(LocalInfoProvider provider) {
     std::lock_guard lock(mutex_);
     localInfoProvider_ = std::move(provider);
+}
+
+void TailscaleWgxRoute::setDerpMapProvider(DerpMapProvider provider) {
+    std::lock_guard lock(mutex_);
+    derpMapProvider_ = std::move(provider);
 }
 
 void TailscaleWgxRoute::setBackend(std::shared_ptr<IWgxBackend> backend) {
@@ -424,6 +621,7 @@ bool TailscaleWgxRoute::start(const RemoteRouteTarget& target,
     }
 
     Key32 peerKey{};
+    int homeDerpRegion = 0;
     if (peerResolver_) {
         auto peer = peerResolver_(target.peerId);
         if (!peer) {
@@ -440,6 +638,7 @@ bool TailscaleWgxRoute::start(const RemoteRouteTarget& target,
             return false;
         }
         peerKey = peer->nodeKey;
+        homeDerpRegion = peer->homeDerp;
     } else {
         if (error)
             *error = "Tailscale peer resolver is not configured";
@@ -458,6 +657,15 @@ bool TailscaleWgxRoute::start(const RemoteRouteTarget& target,
 
     if (!backend_->addOrUpdatePeer(peerNumId, peerKey, target.peerAddress,
                                    error))
+        return false;
+
+    // The encrypted packet path must be relayed (DERP) before any proxy
+    // listener is opened. Advertising a route without a working relay is what
+    // used to blackhole GameStream handshakes into a hang.
+    const std::vector<DerpRegion> derpMap =
+        derpMapProvider_ ? derpMapProvider_() : std::vector<DerpRegion>{};
+    if (!backend_->ensureDerpRoute(peerKey, homeDerpRegion, derpMap,
+                                   localPrivateKey, error))
         return false;
 
     if (!backend_->startTcpProxy(target.peerAddress, kTailscaleTcpPorts, error))

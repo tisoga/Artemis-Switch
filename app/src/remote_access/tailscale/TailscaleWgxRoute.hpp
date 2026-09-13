@@ -33,6 +33,21 @@ public:
     virtual bool startUdpRelay(const std::string& peerIp,
                                std::span<const std::uint16_t> ports,
                                std::string* error) = 0;
+    // Establishes the relayed packet path (DERP) for the peer's WireGuard
+    // session. Called after addOrUpdatePeer, before startTcpProxy. Backends
+    // without relay support fail closed with an explanatory error.
+    virtual bool ensureDerpRoute(const Key32& peerNodeKey, int homeDerpRegion,
+                                 const std::vector<DerpRegion>& derpMap,
+                                 const Key32& localPrivateKey,
+                                 std::string* error) {
+        (void)peerNodeKey;
+        (void)homeDerpRegion;
+        (void)derpMap;
+        (void)localPrivateKey;
+        if (error)
+            *error = "DERP relay is not available in this backend";
+        return false;
+    }
     virtual void stopUdpRelay() noexcept = 0;
     virtual void stop() noexcept = 0;
     [[nodiscard]] virtual bool isRunning() const noexcept = 0;
@@ -50,16 +65,22 @@ public:
     bool startUdpRelay(const std::string& peerIp,
                        std::span<const std::uint16_t> ports,
                        std::string* error) override;
+    bool ensureDerpRoute(const Key32& peerNodeKey, int homeDerpRegion,
+                         const std::vector<DerpRegion>& derpMap,
+                         const Key32& localPrivateKey,
+                         std::string* error) override;
     void stopUdpRelay() noexcept override;
     void stop() noexcept override;
     [[nodiscard]] bool isRunning() const noexcept override;
     [[nodiscard]] bool isTcpActive() const noexcept;
     [[nodiscard]] bool isUdpActive() const noexcept;
+    [[nodiscard]] bool isDerpReady() const noexcept;
 
 private:
     bool running_ = false;
     bool tcpActive_ = false;
     bool udpActive_ = false;
+    bool derpReady_ = false;
     Key32 privateKey_{};
     std::string localIp_;
     std::string activePeerIp_;
@@ -73,6 +94,7 @@ public:
         std::function<std::optional<Peer>(std::string_view peerId)>;
     using LocalInfoProvider =
         std::function<std::optional<std::pair<std::string, Key32>>()>;
+    using DerpMapProvider = std::function<std::vector<DerpRegion>()>;
 
     explicit TailscaleWgxRoute(std::shared_ptr<IWgxBackend> backend = nullptr,
                                PeerResolver peerResolver = nullptr,
@@ -80,6 +102,7 @@ public:
 
     void setPeerResolver(PeerResolver resolver);
     void setLocalInfoProvider(LocalInfoProvider provider);
+    void setDerpMapProvider(DerpMapProvider provider);
     void setBackend(std::shared_ptr<IWgxBackend> backend);
 
     bool start(const RemoteRouteTarget& target,
@@ -97,6 +120,7 @@ private:
     std::shared_ptr<IWgxBackend> backend_;
     PeerResolver peerResolver_;
     LocalInfoProvider localInfoProvider_;
+    DerpMapProvider derpMapProvider_;
     std::optional<RemoteRouteTarget> activeTarget_;
     bool streamingPrepared_ = false;
 };

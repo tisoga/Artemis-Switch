@@ -371,12 +371,16 @@ bool TailscaleControlSession::readNextNoiseRecord(std::string* record,
 
 bool TailscaleControlSession::poll(PeerDelta* delta,
                                    std::optional<std::vector<Peer>>* fullPeers,
-                                   std::string* localAddress, std::string* error) {
-    if (!ready_ || (!recordReader_ && !transport_) || !delta || !fullPeers || !localAddress) {
+                                   std::string* localAddress,
+                                   std::optional<std::vector<DerpRegion>>* derpMap,
+                                   std::string* error) {
+    if (!ready_ || (!recordReader_ && !transport_) || !delta || !fullPeers ||
+        !localAddress || !derpMap) {
         if (error) *error = "Tailscale control session is not connected";
         return false;
     }
     if (fullPeers->has_value()) fullPeers->reset();
+    derpMap->reset();
     delta->changed.clear();
     delta->removedStableIds.clear();
     localAddress->clear();
@@ -437,6 +441,7 @@ bool TailscaleControlSession::poll(PeerDelta* delta,
     if (update->keepAlive) return true;
     if (update->fullPeers) *fullPeers = std::move(*update->fullPeers);
     if (!update->localAddress.empty()) *localAddress = update->localAddress;
+    if (update->derpMap) *derpMap = std::move(*update->derpMap);
     delta->changed = std::move(update->delta.changed);
     delta->removedStableIds = std::move(update->delta.removedStableIds);
     return true;
