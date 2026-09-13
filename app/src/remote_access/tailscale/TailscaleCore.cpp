@@ -228,6 +228,21 @@ void TailscaleCore::workerMain(SecureBytes authKey, SecureBytes passphrase) {
                 setState(Snapshot::State::Error, "Control disconnected", error);
             break;
         }
+        // One summary line per poll so a device log shows exactly what each
+        // frame carried: full peer lists, deltas, relay maps, or nothing.
+        {
+            std::string summary = "netmap update: full=";
+            summary += fullPeers ? std::to_string(fullPeers->size()) : "none";
+            summary += " local=";
+            summary += localAddress.empty() ? "none" : localAddress;
+            summary += " derp=";
+            summary += derpMap ? std::to_string(derpMap->size()) + " regions"
+                               : "none";
+            summary += " delta=+" + std::to_string(delta.changed.size()) + "/-" +
+                       std::to_string(delta.removedStableIds.size()) + "/~" +
+                       std::to_string(delta.onlineChanges.size());
+            LOG_CORE_INFO(summary);
+        }
         if (!localAddress.empty()) {
             LOG_CORE_INFO("Assigned local VPN address: " + localAddress);
         }
@@ -239,16 +254,20 @@ void TailscaleCore::workerMain(SecureBytes authKey, SecureBytes passphrase) {
                 break;
             }
             if (derpMap) {
+                LOG_CORE_INFO("Stored DERP region map (" +
+                              std::to_string(derpMap->size()) + " regions)");
                 updateDerpMap(std::move(*derpMap));
-                LOG_CORE_INFO("Stored DERP region map");
             }
             continue;
         }
         if (!delta.changed.empty() || !delta.removedStableIds.empty() ||
             !delta.onlineChanges.empty())
             peers_.apply(delta, &error);
-        if (derpMap)
+        if (derpMap) {
+            LOG_CORE_INFO("Stored DERP region map (" +
+                          std::to_string(derpMap->size()) + " regions)");
             updateDerpMap(std::move(*derpMap));
+        }
         if (!localAddress.empty()) {
             std::lock_guard lock(snapshotMutex_);
             snapshot_.localAddress = std::move(localAddress);

@@ -163,7 +163,8 @@ bool TailscaleProvider::start() {
     status_ = started ? "Starting" : "Failed";
     lastError_.clear();
     logTs(VpnFileLogger::Severity::Info,
-          "control engine started for " + host);
+          "control engine started for " + host +
+              " (DERP-relay data path)");
     wipe(authKey_);
     wipe(passphrase_);
     return started;

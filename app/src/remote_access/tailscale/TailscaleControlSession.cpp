@@ -23,6 +23,10 @@ void logTsSession(VpnFileLogger::Severity severity, std::string_view message) {
 #include "TailscaleHttp2.hpp"
 #include "TailscaleTypes.hpp"
 
+#if defined(__SWITCH__)
+#include <borealis/extern/nlohmann/json.hpp>
+#endif
+
 extern "C" {
 #include <monocypher.h>
 }
@@ -431,6 +435,27 @@ bool TailscaleControlSession::poll(PeerDelta* delta,
     }
 
     LOG_SESSION_INFO("Processing netmap JSON (" + std::to_string(record.size()) + " bytes): " + record.substr(0, std::min<size_t>(record.size(), 80)));
+#if defined(__SWITCH__)
+    // Top-level keys only (no values): reveals schema drift between control
+    // implementations without dumping peer keys into the log.
+    {
+        const auto keyed =
+            nlohmann::json::parse(record, nullptr, false);
+        if (keyed.is_object()) {
+            std::string keys;
+            for (auto it = keyed.begin(); it != keyed.end(); ++it) {
+                if (!keys.empty())
+                    keys += ",";
+                keys += it.key();
+                if (keys.size() > 256) {
+                    keys += ",...";
+                    break;
+                }
+            }
+            LOG_SESSION_INFO("netmap keys: [" + keys + "]");
+        }
+    }
+#endif
     auto update = mapCodec_.decode(record, error);
     if (!update) {
         LOG_SESSION_ERROR("MapCodec decode failed: " + (error ? *error : ""));

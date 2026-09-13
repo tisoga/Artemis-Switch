@@ -647,6 +647,11 @@ void TailscaleWgxRoute::setBackend(std::shared_ptr<IWgxBackend> backend) {
 bool TailscaleWgxRoute::start(const RemoteRouteTarget& target,
                               std::string* error) {
     std::lock_guard lock(mutex_);
+#if defined(__SWITCH__) && defined(ENABLE_TAILSCALE)
+    logTsRoute(VpnFileLogger::Severity::Info,
+               "route start: peer=" + target.peerId +
+                   " addr=" + target.peerAddress);
+#endif
     if (!backend_) {
         if (error)
             *error =
