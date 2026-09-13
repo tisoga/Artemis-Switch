@@ -426,6 +426,15 @@ public:
             derpThread_ = std::thread(&RealWgxBackend::derpReader, this);
             logTsRoute(VpnFileLogger::Severity::Info,
                        "DERP relay connected via " + node.host);
+            // Ask the relay to report peer presence changes so the log shows
+            // whether the destination node is visible from this region.
+            {
+                std::lock_guard lock(derpWriteMutex_);
+                std::string watchError;
+                if (!derp_->writeRaw(DerpFrameType::WatchConns, {}, &watchError))
+                    logTsRoute(VpnFileLogger::Severity::Warning,
+                               "DERP presence watch failed: " + watchError);
+            }
             return true;
         }
         const std::string failure =
@@ -568,8 +577,30 @@ public:
             }
             case DerpFrameType::Pong:
             case DerpFrameType::KeepAlive:
+                break;
             case DerpFrameType::PeerPresent:
-            case DerpFrameType::PeerGone:
+            case DerpFrameType::PeerGone: {
+                // Presence traffic names 32-byte node keys; log a short
+                // prefix so runs can be correlated with the admin console
+                // without dumping full keys into the log.
+                const auto& payload = frame->payload;
+                std::string who = "unknown";
+                if (payload.size() >= 32) {
+                    constexpr char kHex[] = "0123456789abcdef";
+                    who.clear();
+                    for (int i = 0; i < 8; ++i) {
+                        who.push_back(kHex[payload[i] >> 4U]);
+                        who.push_back(kHex[payload[i] & 0x0fU]);
+                    }
+                }
+                logTsRoute(VpnFileLogger::Severity::Info,
+                           std::string(
+                               frame->type == DerpFrameType::PeerPresent
+                                   ? "DERP reports node present: "
+                                   : "DERP reports node gone: ") +
+                               who);
+                break;
+            }
             case DerpFrameType::Health:
             default:
                 break;
@@ -745,11 +776,20 @@ bool TailscaleWgxRoute::start(const RemoteRouteTarget& target,
         peerKey = peer->nodeKey;
         homeDerpRegion = peer->homeDerp;
 #if defined(__SWITCH__) && defined(ENABLE_TAILSCALE)
-        logTsRoute(VpnFileLogger::Severity::Info,
-                   "peer " + target.peerId + ": online=" +
-                       (peer->online ? "yes" : "no") + " homeDerp=" +
-                       std::to_string(peer->homeDerp) + " endpoints=" +
-                       std::to_string(peer->endpoints.size()));
+        {
+            constexpr char kHex[] = "0123456789abcdef";
+            std::string keyPrefix;
+            for (int i = 0; i < 8; ++i) {
+                keyPrefix.push_back(kHex[peerKey[i] >> 4U]);
+                keyPrefix.push_back(kHex[peerKey[i] & 0x0fU]);
+            }
+            logTsRoute(VpnFileLogger::Severity::Info,
+                       "peer " + target.peerId + ": online=" +
+                           (peer->online ? "yes" : "no") + " homeDerp=" +
+                           std::to_string(peer->homeDerp) + " endpoints=" +
+                           std::to_string(peer->endpoints.size()) +
+                           " nodekey=" + keyPrefix + "...");
+        }
 #endif
     } else {
         if (error)
