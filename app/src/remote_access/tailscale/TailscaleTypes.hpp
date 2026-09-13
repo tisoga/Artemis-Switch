@@ -36,6 +36,7 @@ struct Peer {
     Key32 discoKey{};
     std::string hostname;
     std::vector<std::string> addresses;
+    std::vector<std::string> allowedIPs;
     std::vector<Endpoint> endpoints;
     int homeDerp = 0;
     bool online = false;

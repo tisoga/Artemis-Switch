@@ -210,7 +210,7 @@ std::string TailscaleProvider::status() const {
     case Snapshot::State::Ready:
         // The control plane is up and peers are known, but the encrypted
         // packet path is still gated closed until a peer session is usable.
-        return "Ready (control connected; streaming path pending)";
+        return "Ready";
     case Snapshot::State::Error:
         return snapshot.lastError.empty() ? "Error" : snapshot.lastError;
     }
