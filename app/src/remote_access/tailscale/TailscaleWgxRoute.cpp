@@ -7,6 +7,7 @@ extern "C" {
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <fcntl.h>
 }
 #include "../../vpn/SocketFdLock.hpp"
 #include <wg_lwip_relay.hpp>
@@ -14,6 +15,7 @@ extern "C" {
 
 #include <algorithm>
 #include <charconv>
+#include <cstring>
 
 namespace artemis::tailscale {
 
@@ -130,7 +132,6 @@ bool SimulatedWgxBackend::isUdpActive() const noexcept { return udpActive_; }
 #if defined(__SWITCH__) && defined(ENABLE_TAILSCALE)
 
 namespace {
-void realEgressCallback(void*, uint32_t, const void*, size_t) {}
 void realIngressCallback(void*, const void*, size_t) {}
 void tailscaleRelayLog(wgnx::LogLevel, const char*) {}
 } // namespace
@@ -138,6 +139,22 @@ void tailscaleRelayLog(wgnx::LogLevel, const char*) {}
 class RealWgxBackend final : public IWgxBackend {
 public:
     ~RealWgxBackend() override { stop(); }
+
+    static void realEgressCallback(void* user, uint32_t peer_id, const void* packet, size_t length) {
+        auto* backend = static_cast<RealWgxBackend*>(user);
+        if (backend) {
+            backend->sendEgress(peer_id, packet, length);
+        }
+    }
+
+    void sendEgress(uint32_t peerId, const void* packet, size_t length) {
+        (void)peerId;
+        if (udpSocket_ >= 0 && activePeerConfigured_) {
+            ::sendto(udpSocket_, packet, length, 0,
+                     reinterpret_cast<const sockaddr*>(&peerEndpoint_),
+                     sizeof(peerEndpoint_));
+        }
+    }
 
     bool startTunnel(const Key32& privateKey, const std::string& localIp,
                      std::string* error) override {
@@ -148,22 +165,38 @@ public:
             return false;
         }
 
+        udpSocket_ = static_cast<int>(::socket(AF_INET, SOCK_DGRAM, 0));
+        if (udpSocket_ >= 0) {
+            const int flags = fcntl(udpSocket_, F_GETFL, 0);
+            if (flags >= 0)
+                fcntl(udpSocket_, F_SETFL, flags | O_NONBLOCK);
+
+            struct sockaddr_in bindAddr{};
+            bindAddr.sin_family = AF_INET;
+            bindAddr.sin_addr.s_addr = INADDR_ANY;
+            bindAddr.sin_port = 0;
+            ::bind(udpSocket_, reinterpret_cast<sockaddr*>(&bindAddr), sizeof(bindAddr));
+        }
+
         context_ = wgx_create(privateKey.data(), localAddr.s_addr,
                               realEgressCallback, realIngressCallback, this);
         if (!context_) {
             if (error) *error = "wgx_create failed";
+            if (udpSocket_ >= 0) { ::close(udpSocket_); udpSocket_ = -1; }
             return false;
         }
 
         if (wgx_start(context_) != 0) {
             wgx_destroy(context_);
             context_ = nullptr;
+            if (udpSocket_ >= 0) { ::close(udpSocket_); udpSocket_ = -1; }
             if (error) *error = "wgx_start failed";
             return false;
         }
 
         localIp_ = localIp;
         running_ = true;
+        rxThread_ = std::thread(&RealWgxBackend::rxWorker, this);
         return true;
     }
 
@@ -185,7 +218,14 @@ public:
             return false;
         }
         wgx_connect_peer(context_, peerId);
+
+        ::memset(&peerEndpoint_, 0, sizeof(peerEndpoint_));
+        peerEndpoint_.sin_family = AF_INET;
+        peerEndpoint_.sin_port = htons(41641); // Tailscale default WireGuard port
+        peerEndpoint_.sin_addr = peerAddr;
+        activePeerId_ = peerId;
         activePeerIp_ = peerIp;
+        activePeerConfigured_ = true;
         return true;
     }
 
@@ -252,7 +292,36 @@ public:
         udpPrepared_ = false;
     }
 
+    void rxWorker() {
+        while (running_) {
+            if (udpSocket_ >= 0 && context_ && activePeerId_ != 0) {
+                uint8_t buffer[2048];
+                sockaddr_in fromAddr{};
+                socklen_t fromLen = sizeof(fromAddr);
+                const ssize_t received = ::recvfrom(
+                    udpSocket_, buffer, sizeof(buffer), 0,
+                    reinterpret_cast<sockaddr*>(&fromAddr), &fromLen);
+                if (received > 0) {
+                    wgx_inject_encrypted(context_, activePeerId_, buffer,
+                                         static_cast<size_t>(received));
+                }
+            }
+            if (relay_) {
+                relay_->tick();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
+
     void stop() noexcept override {
+        running_ = false;
+        if (rxThread_.joinable()) {
+            rxThread_.join();
+        }
+        if (udpSocket_ >= 0) {
+            ::close(udpSocket_);
+            udpSocket_ = -1;
+        }
         if (relay_) {
             auto guard = SocketFdLock::instance().guard();
             relay_.reset();
@@ -261,10 +330,11 @@ public:
             wgx_destroy(context_);
             context_ = nullptr;
         }
-        running_ = false;
-        udpPrepared_ = false;
         localIp_.clear();
         activePeerIp_.clear();
+        activePeerId_ = 0;
+        activePeerConfigured_ = false;
+        udpPrepared_ = false;
     }
 
     bool isRunning() const noexcept override {
@@ -274,9 +344,14 @@ public:
 private:
     WgxContext* context_ = nullptr;
     std::unique_ptr<wgnx::LwipRelay> relay_;
+    int udpSocket_ = -1;
+    sockaddr_in peerEndpoint_{};
+    uint32_t activePeerId_ = 0;
+    bool activePeerConfigured_ = false;
+    std::thread rxThread_;
     std::string localIp_;
     std::string activePeerIp_;
-    bool running_ = false;
+    std::atomic_bool running_ = false;
     bool udpPrepared_ = false;
 };
 #endif
