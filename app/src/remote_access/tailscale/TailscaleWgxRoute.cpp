@@ -445,6 +445,44 @@ public:
             derpThread_ = std::thread(&RealWgxBackend::derpReader, this);
             logTsRoute(VpnFileLogger::Severity::Info,
                        "DERP relay connected via " + node.host);
+            // Self-test the session before trusting it with the handshake:
+            // a Ping must come back as Pong within ~3s. This exercises the
+            // read path with no peer, mesh, or filter involved. Advisory
+            // only: a missing echo is logged, the route attempt continues.
+            {
+                const std::uint64_t token =
+                    static_cast<std::uint64_t>(
+                        std::chrono::steady_clock::now()
+                            .time_since_epoch()
+                            .count());
+                std::string pingError;
+                bool pingSent = false;
+                {
+                    std::lock_guard lock(derpWriteMutex_);
+                    pingSent = derp_ && derp_->sendPing(token, &pingError);
+                }
+                if (!pingSent) {
+                    logTsRoute(VpnFileLogger::Severity::Warning,
+                               "DERP echo ping not sent: " + pingError);
+                } else {
+                    bool echoed = false;
+                    for (int waited = 0; waited < 60; ++waited) {
+                        if (lastPongToken_.load(std::memory_order_acquire) ==
+                            token) {
+                            echoed = true;
+                            break;
+                        }
+                        if (!derpAlive_)
+                            break;
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(50));
+                    }
+                    logTsRoute(
+                        echoed ? VpnFileLogger::Severity::Info
+                               : VpnFileLogger::Severity::Warning,
+                        echoed ? "DERP echo OK" : "DERP echo: no Pong reply");
+                }
+            }
             // NOTE: no WatchConns subscription here. Frame 0x10 from a plain
             // client is a protocol violation: the relay closes the session
             // the instant it arrives, which used to masquerade as a peer
@@ -590,7 +628,23 @@ public:
                                     nullptr);
                 break;
             }
-            case DerpFrameType::Pong:
+            case DerpFrameType::Pong: {
+                // Echo reply to our own Ping (see ensureDerpRoute): proves
+                // the relay session is bidirectional without involving any
+                // peer, mesh hop, or filter.
+                if (frame->payload.size() >= 8) {
+                    std::uint64_t token = 0;
+                    for (int i = 7; i >= 0; --i)
+                        token = (token << 8U) | frame->payload[i];
+                    lastPongToken_.store(token, std::memory_order_release);
+                    if (!pongLogged_) {
+                        pongLogged_ = true;
+                        logTsRoute(VpnFileLogger::Severity::Info,
+                                   "DERP echo reply received");
+                    }
+                }
+                break;
+            }
             case DerpFrameType::KeepAlive:
                 break;
             case DerpFrameType::PeerPresent:
@@ -645,6 +699,7 @@ public:
         derpAlive_ = false;
         havePeer_ = false;
         egressLogged_ = false;
+        pongLogged_ = false;
         for (auto& seen : egressTypes_)
             seen = false;
         activeDerpRegion_ = 0;
@@ -692,9 +747,11 @@ private:
     std::mutex derpWriteMutex_;
     std::atomic_bool derpRunning_{false};
     std::atomic_bool derpAlive_{false};
+    std::atomic_uint64_t lastPongToken_{0};
     Key32 peerNodeKey_{};
     bool havePeer_ = false;
     bool egressLogged_ = false;
+    bool pongLogged_ = false;
     bool egressTypes_[8] = {false};
     int activeDerpRegion_ = 0;
     std::string activeDerpHost_;
