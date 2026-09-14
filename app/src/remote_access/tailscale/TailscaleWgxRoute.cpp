@@ -369,18 +369,36 @@ public:
                 break;
             }
         }
-        if (!region || region->nodes.empty()) {
+        // Candidate regions: home first, then the rest of the map in order.
+        // Official clients race regions by latency; pinning home-only strands
+        // us on a far region while the tailnet's working traffic goes
+        // elsewhere. Bounded so a dead map fails in seconds, not minutes.
+        constexpr std::size_t kMaxFallbackRegions = 6;
+        std::vector<const DerpRegion*> regions;
+        regions.reserve(std::min<std::size_t>(derpMap.size(), kMaxFallbackRegions));
+        if (region && !region->nodes.empty())
+            regions.push_back(region);
+        for (const auto& candidate : derpMap) {
+            if (regions.size() >= kMaxFallbackRegions)
+                break;
+            if (region && candidate.regionId == region->regionId)
+                continue;
+            if (candidate.nodes.empty())
+                continue;
+            regions.push_back(&candidate);
+        }
+        if (regions.empty()) {
             if (error)
                 *error = "DERP region " + std::to_string(homeDerpRegion) +
-                         " is missing from the control-plane map; cannot relay";
+                         " is missing from the control-plane map and no "
+                         "fallback region has nodes; cannot relay";
             return false;
         }
 
-        // Already relaying for this peer through this region: keep the live
-        // session instead of flapping the relay on every route re-activation.
-        if (derpAlive_ && derp_ && havePeer_ &&
-            peerNodeKey_ == peerNodeKey &&
-            activeDerpRegion_ == homeDerpRegion)
+        // Already relaying for this peer: keep the live session instead of
+        // flapping the relay on every route re-activation. The region does
+        // not matter here; a relay connection serves every peer.
+        if (derpAlive_ && derp_ && havePeer_ && peerNodeKey_ == peerNodeKey)
             return true;
         stopDerp();
 
@@ -388,12 +406,14 @@ public:
         tailscale_internal_crypto_x25519_public_key(localPublic.data(),
                                                     localPrivateKey.data());
 
-        logTsRoute(VpnFileLogger::Severity::Info,
-                   "dialing DERP region " + std::to_string(homeDerpRegion) +
-                       " (" + std::to_string(region->nodes.size()) +
-                       " node(s)) for peer");
         std::string lastError = "no DERP node attempted";
-        for (const auto& node : region->nodes) {
+        for (const DerpRegion* tryRegion : regions) {
+            logTsRoute(VpnFileLogger::Severity::Info,
+                       "dialing DERP region " +
+                           std::to_string(tryRegion->regionId) + " (" +
+                           std::to_string(tryRegion->nodes.size()) +
+                           " node(s)) for peer");
+            for (const auto& node : tryRegion->nodes) {
             logTsRoute(VpnFileLogger::Severity::Info,
                        "DERP dialing " + node.host + ":" +
                            std::to_string(node.port));
@@ -489,10 +509,14 @@ public:
             // handshake timeout. PeerPresent/PeerGone below stay handled in
             // case the server volunteers any.
             return true;
-        }
+            } // nodes in this region
+            logTsRoute(VpnFileLogger::Severity::Warning,
+                       "DERP region " + std::to_string(tryRegion->regionId) +
+                           " failed: " + lastError);
+        } // candidate regions
         const std::string failure =
-            "DERP region " + std::to_string(homeDerpRegion) +
-            " unreachable: " + lastError;
+            "DERP regions unreachable (" +
+            std::to_string(regions.size()) + " tried): " + lastError;
         if (error)
             *error = failure;
         logTsRoute(VpnFileLogger::Severity::Error, failure);
