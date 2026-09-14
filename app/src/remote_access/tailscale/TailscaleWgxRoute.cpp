@@ -420,6 +420,20 @@ public:
         Key32 localPublic{};
         tailscale_internal_crypto_x25519_public_key(localPublic.data(),
                                                     localPrivateKey.data());
+        {
+            // Identity proof: the pubkey we authenticate to DERP with must
+            // match the node key control registered (admin console). If
+            // these differ, the mesh drops our packets silently in both
+            // directions and no handshake ever completes.
+            constexpr char kHex[] = "0123456789abcdef";
+            std::string localPrefix;
+            for (int i = 0; i < 8; ++i) {
+                localPrefix.push_back(kHex[localPublic[i] >> 4U]);
+                localPrefix.push_back(kHex[localPublic[i] & 0x0fU]);
+            }
+            logTsRoute(VpnFileLogger::Severity::Info,
+                       "DERP local nodekey=" + localPrefix + "...");
+        }
 
         std::string lastError = "no DERP node attempted";
         for (const DerpRegion* tryRegion : regions) {
@@ -640,12 +654,20 @@ public:
                     std::memcmp(payload.data(), peerNodeKey_.data(),
                                 kDerpKeyLen) != 0) {
                     // A packet from a node we are not talking to (stale
-                    // session, wrong peer key) — never inject it.
+                    // session, wrong peer key) — never inject it. Log the
+                    // source prefix so a run can prove whether the mesh is
+                    // delivering anything at all.
                     if (!foreignLogged) {
                         foreignLogged = true;
+                        constexpr char kHex[] = "0123456789abcdef";
+                        std::string srcPrefix;
+                        for (int i = 0; i < 8; ++i) {
+                            srcPrefix.push_back(kHex[payload[i] >> 4U]);
+                            srcPrefix.push_back(kHex[payload[i] & 0x0fU]);
+                        }
                         logTsRoute(VpnFileLogger::Severity::Warning,
                                    "DERP relay sent a packet from an unknown "
-                                   "node; ignoring");
+                                   "node " + srcPrefix + "...; ignoring");
                     }
                     break;
                 }
