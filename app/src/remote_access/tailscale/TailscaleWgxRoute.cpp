@@ -248,6 +248,21 @@ public:
                                std::to_string(msgType) + " len=" +
                                std::to_string(length));
             }
+            // First initiation in full: type/mac layout is public data
+            // (ephemeral key, opaque ciphertext, MACs). Lets the mac1 be
+            // verified offline against the responder's public key.
+            if (msgType == 1 && length == 148 && !initiationLogged_) {
+                initiationLogged_ = true;
+                constexpr char kHex[] = "0123456789abcdef";
+                std::string dump;
+                dump.reserve(length * 2);
+                for (std::size_t i = 0; i < length; ++i) {
+                    dump.push_back(kHex[bytes[i] >> 4U]);
+                    dump.push_back(kHex[bytes[i] & 0x0fU]);
+                }
+                logTsRoute(VpnFileLogger::Severity::Info,
+                           "WireGuard initiation bytes: " + dump);
+            }
         }
         std::lock_guard lock(derpWriteMutex_);
         if (!derpAlive_ || !derp_ || !havePeer_)
@@ -724,6 +739,7 @@ public:
         havePeer_ = false;
         egressLogged_ = false;
         pongLogged_ = false;
+        initiationLogged_ = false;
         for (auto& seen : egressTypes_)
             seen = false;
         activeDerpRegion_ = 0;
@@ -776,6 +792,7 @@ private:
     bool havePeer_ = false;
     bool egressLogged_ = false;
     bool pongLogged_ = false;
+    bool initiationLogged_ = false;
     bool egressTypes_[8] = {false};
     int activeDerpRegion_ = 0;
     std::string activeDerpHost_;
