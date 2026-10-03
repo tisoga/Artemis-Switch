@@ -5,6 +5,8 @@
 
 #include <borealis/extern/nlohmann/json.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <limits>
 
@@ -18,6 +20,49 @@ std::string stripPrefix(std::string address) {
     if (slash != std::string::npos)
         address.resize(slash);
     return address;
+}
+
+// Hostinfo.OS and the TCP ports in Hostinfo.Services, used to tell game
+// hosts from phones and servers. Every field is optional and type-checked:
+// control may omit, null or trim any of it.
+void parseHostinfo(const Json& node, Peer& peer) {
+    const auto hostinfo = node.find("Hostinfo");
+    if (hostinfo == node.end() || !hostinfo->is_object())
+        return;
+    if (const auto os = hostinfo->find("OS");
+        os != hostinfo->end() && os->is_string()) {
+        peer.os = os->get<std::string>();
+        if (peer.os.size() > 32)
+            peer.os.resize(32);
+        std::transform(peer.os.begin(), peer.os.end(), peer.os.begin(),
+                       [](unsigned char c) {
+                           return static_cast<char>(std::tolower(c));
+                       });
+    }
+    const auto services = hostinfo->find("Services");
+    if (services == hostinfo->end() || !services->is_array())
+        return;
+    peer.servicesKnown = true;
+    constexpr std::size_t kMaxServices = 256;
+    for (const auto& service : *services) {
+        if (peer.tcpServicePorts.size() >= kMaxServices)
+            break;
+        if (!service.is_object())
+            continue;
+        const auto proto = service.find("Proto");
+        const auto port = service.find("Port");
+        if (proto == service.end() || !proto->is_string() ||
+            proto->get<std::string>() != "tcp" || port == service.end() ||
+            !port->is_number_unsigned())
+            continue;
+        const auto value = port->get<std::uint64_t>();
+        if (value == 0 || value > 65535)
+            continue;
+        const auto tcpPort = static_cast<std::uint16_t>(value);
+        if (std::find(peer.tcpServicePorts.begin(), peer.tcpServicePorts.end(),
+                      tcpPort) == peer.tcpServicePorts.end())
+            peer.tcpServicePorts.push_back(tcpPort);
+    }
 }
 
 std::optional<Peer> parsePeer(
@@ -62,17 +107,31 @@ std::optional<Peer> parsePeer(
                 peer.addresses.push_back(stripPrefix(value.get<std::string>()));
         }
     }
-    if (peer.addresses.empty()) {
-        if (const auto allowed = node.find("AllowedIPs");
-            allowed != node.end() && allowed->is_array()) {
-            if (allowed->size() > 32) {
-                if (error) *error = "netmap peer address limit exceeded";
-                return std::nullopt;
+    if (const auto allowed = node.find("AllowedIPs");
+        allowed != node.end() && allowed->is_array()) {
+        const bool addressesFromAllowed = peer.addresses.empty();
+        if (addressesFromAllowed && allowed->size() > 32) {
+            if (error) *error = "netmap peer address limit exceeded";
+            return std::nullopt;
+        }
+        for (const auto& value : *allowed) {
+            if (!value.is_string())
+                continue;
+            // A subnet router can advertise many routes; keep a bounded set
+            // instead of rejecting the whole peer.
+            if (!addressesFromAllowed &&
+                peer.allowedIPs.size() >= PeerDirectory::kMaxAllowedIPsPerPeer)
+                break;
+            const auto cidr = value.get<std::string>();
+            if (addressesFromAllowed) {
+                peer.addresses.push_back(stripPrefix(cidr));
+                continue;
             }
-            for (const auto& value : *allowed) {
-                if (value.is_string())
-                    peer.addresses.push_back(stripPrefix(value.get<std::string>()));
-            }
+            // Subnet routes advertised by this peer (e.g. an OpenWrt subnet
+            // router sharing 192.168.1.0/24). Exit-node default routes and
+            // the peer's own /32 are not LAN subnets and are skipped.
+            if (PeerDirectory::isRoutableIPv4Subnet(cidr, peer.addresses))
+                peer.allowedIPs.push_back(cidr);
         }
     }
     if (const auto endpoints = node.find("Endpoints");
@@ -113,6 +172,7 @@ std::optional<Peer> parsePeer(
         }
     }
     peer.online = node.value("Online", false);
+    parseHostinfo(node, peer);
     if (nodeId != 0)
         idMap[nodeId] = peer.stableId;
     return peer;
@@ -208,6 +268,15 @@ std::optional<std::vector<DerpRegion>> parseDerpMap(const Json& root,
                 if (port <= 0 || port > 65535)
                     continue;
                 derpNode.port = static_cast<std::uint16_t>(port);
+                // STUNPort: 0 means the default 3478, negative disables it.
+                const int stunPort = node.value("STUNPort", 0);
+                derpNode.stunPort =
+                    stunPort < 0 || stunPort > 65535
+                        ? std::uint16_t{0}
+                        : static_cast<std::uint16_t>(stunPort == 0 ? 3478
+                                                                   : stunPort);
+                if (node.value("STUNOnly", false))
+                    continue; // no DERP service on this node
                 entry.nodes.push_back(std::move(derpNode));
             }
         }

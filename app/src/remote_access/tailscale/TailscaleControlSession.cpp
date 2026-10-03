@@ -257,10 +257,6 @@ int http2ResponseStatus(const Http2Frame& frame) {
     return status;
 }
 
-// HTTP/2 default receive window. This client never sends WINDOW_UPDATE, so a
-// compliant server stops sending DATA once this many bytes are outstanding.
-constexpr std::uint64_t kHttp2DefaultWindow = 65535;
-
 #if defined(__SWITCH__)
 // Type-checked field readers: control may send null for optional fields and
 // a throwing nlohmann accessor must never take the control loop down.
@@ -283,6 +279,49 @@ std::string jsonString(const nlohmann::json& object, const char* key) {
 std::size_t jsonArraySize(const nlohmann::json& object, const char* key) {
     const auto it = object.find(key);
     return it != object.end() && it->is_array() ? it->size() : 0;
+}
+
+// " os=windows services=12 tcp=[47984,47989,...] gamestream=yes" for the
+// Add Host filter: shows what control tells us about each peer's software.
+std::string hostinfoSummary(const nlohmann::json& peer) {
+    const auto hostinfo = peer.find("Hostinfo");
+    if (hostinfo == peer.end() || !hostinfo->is_object())
+        return " hostinfo=absent";
+    std::string out = " os=";
+    const auto os = hostinfo->find("OS");
+    out += os != hostinfo->end() && os->is_string() ? os->get<std::string>()
+                                                     : std::string("unknown");
+    const auto services = hostinfo->find("Services");
+    if (services == hostinfo->end() || !services->is_array())
+        return out + " services=absent";
+    std::vector<unsigned> ports;
+    for (const auto& service : *services) {
+        if (!service.is_object())
+            continue;
+        const auto proto = service.find("Proto");
+        const auto port = service.find("Port");
+        if (proto != service.end() && proto->is_string() &&
+            proto->get<std::string>() == "tcp" && port != service.end() &&
+            port->is_number_unsigned())
+            ports.push_back(port->get<unsigned>());
+    }
+    std::sort(ports.begin(), ports.end());
+    ports.erase(std::unique(ports.begin(), ports.end()), ports.end());
+    const bool gamestream =
+        std::find(ports.begin(), ports.end(), 47989U) != ports.end() ||
+        std::find(ports.begin(), ports.end(), 47984U) != ports.end();
+    out += " services=" + std::to_string(services->size()) + " tcp=[";
+    constexpr std::size_t kMaxPortsShown = 16;
+    for (std::size_t i = 0; i < ports.size() && i < kMaxPortsShown; ++i) {
+        if (i)
+            out += ",";
+        out += std::to_string(ports[i]);
+    }
+    if (ports.size() > kMaxPortsShown)
+        out += ",...";
+    out += "] gamestream=";
+    out += gamestream ? "yes" : "no";
+    return out;
 }
 
 bool jsonHasArray(const nlohmann::json& object, const char* key) {
@@ -404,7 +443,8 @@ void logNetmapDiagnostics(const nlohmann::json& root, const Key32& nodePublic) {
                 " homeDERP=" + std::to_string(nodeHomeDerp(peer)) +
                 " endpoints=" + std::to_string(jsonArraySize(peer, "Endpoints")) +
                 " disco=" + (jsonString(peer, "DiscoKey").empty() ? "no" : "yes") +
-                " nodekey=" + shortTypedKey(jsonString(peer, "Key")));
+                " nodekey=" + shortTypedKey(jsonString(peer, "Key")) +
+                hostinfoSummary(peer));
             ++index;
         }
     }
@@ -441,15 +481,12 @@ void TailscaleControlSession::traceFrame(const Http2Frame& frame) {
     switch (frame.type) {
     case 0x00: { // DATA
         dataBytesReceived_ += frame.payload.size();
-        if (!windowWarned_ && dataBytesReceived_ > kHttp2DefaultWindow / 2) {
+        if (!windowWarned_ && dataBytesReceived_ > kHttp2DefaultWindow) {
+            // Past the point where the old client (no WINDOW_UPDATE) stalled.
             windowWarned_ = true;
-            LOG_SESSION_WARN(
-                "HTTP/2 control stream has received " +
-                std::to_string(dataBytesReceived_) +
-                " bytes and this client never sends WINDOW_UPDATE; the "
-                "server stops sending at 65535 bytes, after which netmap "
-                "updates and keepalives stall and the connection eventually "
-                "drops");
+            LOG_SESSION_INFO("HTTP/2 control stream passed " +
+                             std::to_string(kHttp2DefaultWindow) +
+                             " bytes; receive windows are being replenished");
         }
         const bool onRegister = frame.streamId == registerStreamId_ &&
                                 registerStreamId_ != 0;
@@ -536,6 +573,53 @@ void TailscaleControlSession::traceFrame(const Http2Frame& frame) {
     }
 }
 
+bool TailscaleControlSession::creditData(const Http2Frame& frame,
+                                        std::string* error) {
+    if (frame.type != 0x00 || frame.length == 0 || !noise_ || !transport_)
+        return true;
+    // Every DATA byte (padding included) counts against the connection
+    // window; only the long-lived map stream needs its own stream window
+    // replenished. Other streams are short replies that end on their own.
+    std::vector<std::vector<std::uint8_t>> updates;
+    if (const auto increment = connectionWindow_.consume(frame.length))
+        updates.push_back(buildHttp2WindowUpdate(0, *increment));
+    const bool streamEnded = (frame.flags & 0x01) != 0;
+    if (frame.streamId == mapStreamId_ && mapStreamId_ != 0 && !streamEnded) {
+        if (const auto increment = mapStreamWindow_.consume(frame.length))
+            updates.push_back(buildHttp2WindowUpdate(mapStreamId_, *increment));
+    }
+    if (updates.empty())
+        return true;
+    std::lock_guard writeLock(writeMutex_);
+    for (const auto& update : updates) {
+        std::vector<std::uint8_t> framed;
+        if (!noise_->frame(update, &framed, error) ||
+            !transport_->write(framed, error))
+            return false;
+    }
+    ++windowUpdatesSent_;
+    if (windowUpdatesSent_ == 1)
+        LOG_SESSION_INFO("sent first HTTP/2 WINDOW_UPDATE after " +
+                         std::to_string(dataBytesReceived_) +
+                         " control bytes");
+    return true;
+}
+
+void TailscaleControlSession::setInitialPreferredDerp(int region) noexcept {
+    initialPreferredDerp_ = region > 0 ? region : 0;
+}
+
+void TailscaleControlSession::setLocalEndpoints(
+    std::vector<std::string> endpoints) {
+    std::lock_guard lock(endpointsMutex_);
+    localEndpoints_ = std::move(endpoints);
+}
+
+std::vector<std::string> TailscaleControlSession::localEndpoints() {
+    std::lock_guard lock(endpointsMutex_);
+    return localEndpoints_;
+}
+
 void TailscaleControlSession::logRegisterResponse(
     std::span<const std::uint8_t> payload) {
 #if defined(__SWITCH__)
@@ -604,6 +688,15 @@ bool TailscaleControlSession::connect(const Identity& identity,
     mapHttpStatus_ = 0;
     dataBytesReceived_ = 0;
     windowWarned_ = false;
+    windowUpdatesSent_ = 0;
+    connectionWindow_.reset();
+    mapStreamWindow_.reset();
+    // A reconnect starts a new HTTP/2 connection and a new full netmap:
+    // nothing buffered from the dropped one may leak into it.
+    http2Decoder_ = Http2FrameDecoder{};
+    mapFrameDecoder_ = MapFrameDecoder{};
+    mapCodec_ = MapCodec{};
+    nextStreamId_ = 1;
 
     if (recordReader_) {
         ready_ = true;
@@ -761,6 +854,11 @@ bool TailscaleControlSession::connect(const Identity& identity,
                 auto h2Frame = http2Decoder_.take();
                 if (h2Frame) {
                     traceFrame(*h2Frame);
+                    if (!creditData(*h2Frame, error)) {
+                        transport_->close();
+                        resetTransport();
+                        return false;
+                    }
                     if (h2Frame->type == 0x04) { // SETTINGS
                         if ((h2Frame->flags & 0x01) == 0) {
                             const auto ack = buildHttp2SettingsAck();
@@ -802,6 +900,11 @@ bool TailscaleControlSession::connect(const Identity& identity,
     mapData.stream = true;
     mapData.hostname = hostname_.empty() ? "artemis-switch" : hostname_;
     mapData.capabilityVersion = capVer;
+    // Home region known from a previous session: advertise it up front so
+    // peers can reach this node from the first netmap instead of waiting
+    // for a follow-up Hostinfo update.
+    mapData.preferredDerp = initialPreferredDerp_;
+    mapData.endpoints = localEndpoints();
 
     const std::string mapJson = encodeMapRequest(mapData);
     if (!mapJson.empty()) {
@@ -823,12 +926,15 @@ bool TailscaleControlSession::connect(const Identity& identity,
                              " stream=true endpoints=" +
                              std::to_string(endpointCount) + " NetInfo=" +
                              (hasNetInfo ? "present" : "absent"));
-            if (!hasNetInfo)
-                LOG_SESSION_WARN(
-                    "MapRequest advertises no home DERP region "
-                    "(Hostinfo.NetInfo.PreferredDERP missing): peers see "
-                    "this node with HomeDERP=0 and have no path to send "
-                    "WireGuard replies back");
+            if (hasNetInfo)
+                LOG_SESSION_INFO("MapRequest advertises home DERP region " +
+                                 std::to_string(initialPreferredDerp_) +
+                                 " from the previous session");
+            else
+                LOG_SESSION_INFO(
+                    "MapRequest has no home DERP region yet (first session "
+                    "on this device); one is advertised right after the "
+                    "first netmap");
         }
 #endif
         const auto headers =
@@ -879,6 +985,7 @@ bool TailscaleControlSession::sendHostinfoUpdate(int preferredDerp,
     update.hostname = hostname_.empty() ? "artemis-switch" : hostname_;
     update.preferredDerp = preferredDerp;
     update.capabilityVersion = capabilityVersion_;
+    update.endpoints = localEndpoints();
     const std::string json = encodeMapRequest(update);
     if (json.empty()) {
         if (error) *error = "cannot encode Hostinfo update";
@@ -902,7 +1009,8 @@ bool TailscaleControlSession::sendHostinfoUpdate(int preferredDerp,
         return false;
     LOG_SESSION_INFO("sent Hostinfo update on stream " +
                      std::to_string(streamId) +
-                     ": NetInfo.PreferredDERP=" + std::to_string(preferredDerp));
+                     ": NetInfo.PreferredDERP=" + std::to_string(preferredDerp) +
+                     " endpoints=" + std::to_string(update.endpoints.size()));
     return true;
 }
 
@@ -954,6 +1062,8 @@ bool TailscaleControlSession::poll(PeerDelta* delta,
             auto h2Frame = http2Decoder_.take();
             if (h2Frame) {
                 traceFrame(*h2Frame);
+                if (!creditData(*h2Frame, error))
+                    return false;
                 if (h2Frame->type == 0x04) { // SETTINGS
                     if ((h2Frame->flags & 0x01) == 0) { // Not ACK
                         const auto ack = buildHttp2SettingsAck();

@@ -8,26 +8,35 @@
     "canonical typed-hex machine, node, and disco key encoding",
     "bounded HTTPS control-key response parsing",
     "verified Switch TLS transport using the platform CA store",
+    "HTTP/2-over-Noise control session",
+    "live registration and netmap streaming",
     "bounded full and delta peer-map decoding",
     "stable-ID IPv4 route resolution",
+    "subnet route resolution via advertising peers (longest prefix, per-host routes)",
     "passphrase-protected identity envelopes",
     "isolated multi-peer wgx ABI",
     "DERP and direct IPv4 path metadata",
-    "HTTP/2-over-Noise control framing",
-    "live registration and netmap streaming",
     "DERP relay crypto_box handshake and packet routing",
-    "WireGuard loopback proxy integration"
+    "WireGuard loopback proxy integration (TCP and UDP media relays)",
+    "interruptible control and DERP shutdown on disconnect",
+    "HTTP/2 receive-window flow control (WINDOW_UPDATE)",
+    "control session reconnect with backoff, keeping the active route",
+    "PreferredDERP in the initial MapRequest from the saved home region",
+    "Hostinfo OS and service-port parsing",
+    "Add Host game-host filtering (OS, reported ports, GameStream probe) and subnet shortcuts",
+    "STUN endpoint discovery and encrypted disco ping/pong/call-me-maybe (opt-in, experimental)",
+    "direct IPv4 UDP WireGuard path with automatic DERP fallback (opt-in, experimental)"
   ],
   "not_implemented": [
-    "STUN and encrypted Disco socket flows",
-    "direct UDP path optimization",
+    "port mapping (UPnP / NAT-PMP / PCP) and hard-NAT birthday probing",
     "dedicated-tailnet capability probe"
   ],
   "platform_inapplicable": [
     "system DNS configuration",
     "system TUN routes",
     "Tailscale SSH",
-    "exit nodes"
+    "exit nodes (0.0.0.0/0 routes are ignored)",
+    "IPv6 addresses and direct paths (the Switch network stack is IPv4-only)"
   ],
-  "release_gate": "Capability 68 accepted. Live control, DERP authenticated transport, and WireGuard localhost proxy are enabled."
+  "release_gate": "Capability 68 accepted. Live control, DERP authenticated transport, WireGuard localhost proxy, and subnet-router LAN hosts are enabled. Direct UDP paths are off by default (Settings: Direct connections)."
 }

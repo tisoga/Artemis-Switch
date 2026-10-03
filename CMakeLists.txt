@@ -382,6 +382,7 @@ elseif (PLATFORM_SWITCH)
         list(APPEND MAIN_SRC
             app/src/vpn/WireGuardConfig.cpp
             app/src/vpn/WireGuardManager.cpp
+            app/src/remote_access/AddHostPeerFilter.cpp
             app/src/remote_access/RemoteAccessManager.cpp
             app/src/remote_access/RemoteAccessSelection.cpp
             app/src/remote_access/RemoteRouting.cpp
@@ -413,6 +414,7 @@ elseif (PLATFORM_SWITCH)
             app/src/remote_access/tailscale/TailscaleBox.cpp
             app/src/remote_access/tailscale/TailscaleControlCodec.cpp
             app/src/remote_access/tailscale/TailscaleControlKey.cpp
+            app/src/remote_access/tailscale/TailscaleDisco.cpp
             app/src/remote_access/tailscale/TailscaleControlSession.cpp
             app/src/remote_access/tailscale/TailscaleDerp.cpp
             app/src/remote_access/tailscale/TailscaleHttpUpgrade.cpp
